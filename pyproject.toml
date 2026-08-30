@@ -47,7 +47,7 @@ known-first-party = ["janus"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-plugins = ["pydantic.mypy", "sqlalchemy.ext.mypy.plugin"]
+plugins = ["pydantic.mypy"]
 mypy_path = "."
 exclude = ["janus/db/migrations"]
 
