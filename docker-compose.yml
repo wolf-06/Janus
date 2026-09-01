@@ -1,0 +1,21 @@
+# Local infrastructure. The app connects via JANUS_DATABASE_URL; the defaults below
+# match the URL in .env.example (postgresql+psycopg://janus:janus@localhost:5432/janus).
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-janus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-janus}
+      POSTGRES_DB: ${POSTGRES_DB:-janus}
+    ports:
+      - "5432:5432"
+    volumes:
+      - janus_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-janus} -d ${POSTGRES_DB:-janus}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  janus_pgdata:
