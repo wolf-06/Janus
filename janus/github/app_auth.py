@@ -25,10 +25,10 @@ import jwt
 from janus.app.config import Settings
 
 GITHUB_API_BASE = "https://api.github.com"
+API_VERSION = "2022-11-28"
 _JWT_TTL_SECONDS = 540  # 9 minutes, below GitHub's 10-minute maximum.
 _CLOCK_SKEW_SECONDS = 60
 _TOKEN_REFRESH_SKEW_SECONDS = 60
-_API_VERSION = "2022-11-28"
 
 
 @dataclass(frozen=True)
@@ -85,7 +85,7 @@ def installation_token(
     headers = {
         "Authorization": f"Bearer {app_jwt(settings, now=int(now_ts))}",
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": _API_VERSION,
+        "X-GitHub-Api-Version": API_VERSION,
     }
     url = f"{GITHUB_API_BASE}/app/installations/{installation_id}/access_tokens"
 
