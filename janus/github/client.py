@@ -76,6 +76,23 @@ class GitHubClient:
         """
         return self._request("GET", f"/repos/{owner}/{repo}/actions/runs/{run_id}/logs").content
 
+    def list_workflow_runs(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        branch: str | None = None,
+        status: str | None = None,
+        per_page: int = 20,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"per_page": per_page}
+        if branch is not None:
+            params["branch"] = branch
+        if status is not None:
+            params["status"] = status
+        data = _as_dict(self._request("GET", f"/repos/{owner}/{repo}/actions/runs", params=params))
+        return cast("list[dict[str, Any]]", data.get("workflow_runs", []))
+
     def list_commits(
         self, owner: str, repo: str, *, sha: str | None = None, per_page: int = 100
     ) -> list[dict[str, Any]]:
