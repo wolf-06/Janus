@@ -280,7 +280,130 @@ initial commit.
 
 ---
 
-## Phase 1 decisions
+## Phase 1 decisions (S0 spine)
 
-Added as Phase 1 is built (schema, webhook verification, auth, client, manifest,
-baseline diff). See the entries below this line as they land.
+### D-014 — GitHub natural ids as primary keys
+
+**Context.** Webhook deliveries repeat; the system must not create duplicate rows.
+
+**Decision.** Use GitHub's ids (``installation_id``, ``repo_id``, ``run_id``) as primary
+keys; internal tables (``jobs``, ``diagnoses``) use surrogate ids.
+
+**Alternatives.** Surrogate ids everywhere with a separate unique column per GitHub id —
+more columns, no benefit, and every lookup needs an extra index.
+
+**Consequences.** (+) Stable, globally-unique keys double as the idempotency key and
+remove a mapping layer. (−) Coupling the schema to GitHub's id space; acceptable for an
+App that only ever sees GitHub entities. *Reversible:* painful later.
+
+---
+
+### D-015 — Webhook idempotency via a unique ``runs.delivery_id``
+
+**Context.** GitHub redelivers webhooks (timeouts, retries). Reprocessing would create
+duplicate runs/jobs and duplicate Check runs.
+
+**Decision.** Store the ``X-GitHub-Delivery`` id on ``runs`` with a unique constraint;
+``get_or_create_run`` returns the existing row and the handler skips side effects.
+
+**Alternatives.** A dedicated ``webhook_deliveries`` table — cleaner for arbitrary event
+types, but S0 only enqueues ``workflow_run``, so one column suffices. Dedup in memory —
+lost on restart.
+
+**Consequences.** (+) At-least-once delivery becomes effectively-once processing; the
+integration test proves a redelivery posts no second Check. (−) If a future event type
+enqueues work without a ``run``, it needs its own dedup key. *Reversible:* yes.
+
+---
+
+### D-016 — ``check_run`` events are acknowledged, never enqueued
+
+**Context.** Janus posts Check runs; GitHub then emits ``check_run`` events.
+
+**Decision.** Accept ``check_run`` with 202 but take no action.
+
+**Alternatives.** React to ``check_run`` — would loop on our own Check runs.
+
+**Consequences.** (+) No feedback loop. (−) Genuine third-party ``check_run`` failures are
+ignored in S0; the plan makes ``workflow_run`` authoritative (open question §5 Q1).
+*Reversible:* yes, when ``check_run`` handling is needed.
+
+---
+
+### D-017 — Baseline = previous successful run on the branch
+
+**Context.** The fault diff needs a base commit; the plan leaves §5 Q2 open.
+
+**Decision.** Pick the most recent completed ``success`` run on the branch that is not the
+failing head (``github/baseline.py``).
+
+**Alternatives.** Merge-base with the default branch — more correct across rebases, but
+needs extra API calls and ancestry checks.
+
+**Consequences.** (+) One API call; matches the provisional plan. (−) Does not verify the
+green run is an ancestor of the head; a force-push/rebase can mislead. Falls back to
+``None`` (unknown diff) rather than guessing. *Reversible:* yes.
+
+---
+
+### D-018 — Manifest credentials persisted to ``.env`` (S0)
+
+**Context.** The manifest callback yields an App id, PEM, webhook secret and OAuth
+credentials that must survive restarts.
+
+**Decision.** Write the PEM to a file and the non-secret values to ``.env`` (gitignored),
+per the plan's S0 recommendation.
+
+**Alternatives.** OS keyring — better secrecy, but a runtime dependency and awkward on
+servers. DB-encrypted column — needs a master key anyway.
+
+**Consequences.** (+) Zero-dependency, easy rotation, obvious to a local operator.
+(−) Secrets sit in a plaintext file; acceptable for a local single-operator S0, and
+``.env`` is gitignored. Document rotation. *Reversible:* yes.
+
+---
+
+### D-019 — Manifest ``state`` is generated but not validated (S0)
+
+**Context.** OAuth-style flows should validate ``state`` to prevent CSRF.
+
+**Decision.** Generate ``state`` and pass it to GitHub, but do not persist/verify it in
+S0.
+
+**Alternatives.** Store ``state`` in a signed cookie or DB row and verify on callback.
+
+**Consequences.** (−) A known gap: a malicious callback could be replayed. Low risk for a
+local, single-operator install; must be fixed before any hosted deployment. Tracked here
+so it is not silently forgotten. *Reversible:* yes.
+
+---
+
+### D-020 — ``/manifest/start`` returns a self-submitting form, not a 302
+
+**Context.** GitHub's manifest creation endpoint expects the manifest as a **POST** body;
+a redirect cannot carry one.
+
+**Decision.** Render a minimal HTML page whose form auto-submits to GitHub.
+
+**Alternatives.** A bare ``RedirectResponse`` — impossible for a POST with a body. Asking
+the user to paste JSON — worse UX.
+
+**Consequences.** (+) True one-click install. (−) Returns HTML from an API-ish path;
+acceptable for a browser-only endpoint. *Reversible:* yes.
+
+---
+
+### D-021 — Sync GitHub/DB work runs in a worker thread
+
+**Context.** The webhook endpoint is ``async`` (to read the raw body), but the DB layer
+and ``httpx`` client are synchronous.
+
+**Decision.** Verify the signature on the event loop, then run persistence and GitHub
+calls via ``run_in_threadpool``.
+
+**Alternatives.** Make the whole stack async (async SQLAlchemy + ``httpx.AsyncClient``) —
+more moving parts for S0. Block the event loop — would stall the server under load.
+
+**Consequences.** (+) No event-loop blocking with a sync stack; 202 returns promptly.
+(−) One thread hop per failed run; negligible at S0 volume. *Reversible:* yes, and the
+call boundary is a single ``run_in_threadpool`` call.

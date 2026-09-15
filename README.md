@@ -56,6 +56,17 @@ App's webhook URL at `POST /webhooks/github`:
 The Phase 1 manifest flow (`/manifest/start`) creates the App and stores its
 credentials; the webhook secret must match `JANUS_GITHUB_WEBHOOK_SECRET`.
 
+## Installing the GitHub App (manifest flow)
+
+1. Start a tunnel and set `JANUS_PUBLIC_URL` to its HTTPS URL in `.env`.
+2. Visit `http://localhost:8000/manifest/start` in a browser. It submits the App
+   manifest to GitHub.
+3. Approve the App. GitHub redirects to `/manifest/callback`, which writes the private
+   key to `JANUS_GITHUB_PRIVATE_KEY_PATH` and records the App id, webhook secret and
+   OAuth credentials in `.env`.
+4. Restart the app so the new settings load. Point the App's webhook at
+   `<JANUS_PUBLIC_URL>/webhooks/github` if GitHub did not set it automatically.
+
 ## Scope & non-goals (S0)
 
 **In scope:** manifest install, HMAC-verified webhooks, log + last-green→first-red diff
