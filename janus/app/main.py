@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from janus.app.api import health, webhooks
+from janus.app.api import health, manifest, webhooks
 from janus.app.config import get_settings
 from janus.app.logging import configure_logging
 from janus.db.session import get_engine
@@ -33,6 +33,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Janus", version="0.0.0", lifespan=lifespan)
     app.include_router(health.router)
     app.include_router(webhooks.router)
+    app.include_router(manifest.router)
     return app
 
 

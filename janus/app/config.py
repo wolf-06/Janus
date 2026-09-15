@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://janus:janus@localhost:5432/janus"
     log_level: str = "INFO"
 
+    # Public base URL used to build the manifest redirect/webhook URLs. Unset locally
+    # (falls back to the request base URL); set it to the tunnel URL (smee.io/ngrok)
+    # when installing the App against a real GitHub account.
+    public_url: str | None = None
+    github_app_name: str = "Janus"
+
     github_app_id: int | None = None
     github_private_key_path: str | None = None
     github_webhook_secret: str | None = None
