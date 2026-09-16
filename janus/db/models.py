@@ -50,7 +50,7 @@ class Installation(Base):
 
     __tablename__ = "installations"
 
-    installation_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    installation_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     account: Mapped[str] = mapped_column(String(255))
     app_id: Mapped[int] = mapped_column(BigInteger)
     scopes: Mapped[list[str]] = mapped_column(JSON, default=list)
@@ -67,7 +67,7 @@ class Repository(Base):
 
     __tablename__ = "repositories"
 
-    repo_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    repo_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     owner: Mapped[str] = mapped_column(String(255))
     name: Mapped[str] = mapped_column(String(255))
     default_branch: Mapped[str] = mapped_column(String(255), default="main")
@@ -89,7 +89,7 @@ class Run(Base):
 
     __tablename__ = "runs"
 
-    run_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    run_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     repo_id: Mapped[int] = mapped_column(
         ForeignKey("repositories.repo_id", ondelete="CASCADE"), index=True
     )
