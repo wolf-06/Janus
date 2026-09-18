@@ -5,8 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
+from fastapi.testclient import TestClient
 
+from janus.app.main import create_app
 from janus.github.app_auth import GITHUB_API_BASE
 from janus.github.manifest import (
     build_manifest,
@@ -85,3 +88,56 @@ def test_persist_credentials_updates_existing_keys(tmp_path: Path) -> None:
     env = env_path.read_text(encoding="utf-8")
     assert "JANUS_GITHUB_APP_ID=123" in env
     assert "JANUS_GITHUB_APP_ID=old" not in env
+
+
+def test_manifest_start_sets_state_cookie() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get("/manifest/start")
+
+    assert response.status_code == 200
+    assert "janus_manifest_state" in response.cookies
+    assert "manifest" in response.text
+
+
+def test_callback_rejects_missing_state() -> None:
+    with TestClient(create_app()) as client:
+        response = client.get("/manifest/callback", params={"code": "abc"})
+
+    assert response.status_code == 400
+
+
+def test_callback_rejects_state_mismatch() -> None:
+    with TestClient(create_app()) as client:
+        client.cookies.set("janus_manifest_state", "expected")
+        response = client.get("/manifest/callback", params={"code": "abc", "state": "other"})
+
+    assert response.status_code == 400
+
+
+def test_callback_with_valid_state_persists_and_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "janus.app.api.manifest.exchange_manifest_code",
+        lambda code: {"id": 1, "pem": "x"},
+    )
+
+    def fake_persist(
+        credentials: dict[str, object], *, private_key_path: object, env_path: object
+    ) -> None:
+        captured["credentials"] = credentials
+
+    monkeypatch.setattr("janus.app.api.manifest.persist_credentials", fake_persist)
+
+    with TestClient(create_app()) as client:
+        client.cookies.set("janus_manifest_state", "nonce")
+        response = client.get(
+            "/manifest/callback",
+            params={"code": "abc", "state": "nonce"},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/manifest/success"
+    assert captured["credentials"] == {"id": 1, "pem": "x"}

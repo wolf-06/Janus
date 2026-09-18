@@ -13,7 +13,7 @@ import json
 import secrets
 from typing import Annotated
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Cookie, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from janus.app.config import get_settings
@@ -28,6 +28,11 @@ router = APIRouter(prefix="/manifest", tags=["manifest"])
 _GITHUB_NEW_APP_URL = "https://github.com/settings/apps/new"
 _DEFAULT_KEY_PATH = "janus-app.pem"
 _ENV_PATH = ".env"
+# The state nonce is bound to the browser that started the flow via an HttpOnly cookie,
+# so a callback cannot be replayed from elsewhere. It is a random nonce, not a secret, so
+# it needs no signature; it only has to match the cookie.
+_STATE_COOKIE = "janus_manifest_state"
+_STATE_MAX_AGE_SECONDS = 600
 
 
 def _base_url(request: Request) -> str:
@@ -59,12 +64,31 @@ def manifest_start(request: Request) -> HTMLResponse:
         "<script>document.getElementById('janus-manifest').submit()</script>"
         "</body></html>"
     )
-    return HTMLResponse(page)
+    response = HTMLResponse(page)
+    response.set_cookie(
+        _STATE_COOKIE,
+        state,
+        max_age=_STATE_MAX_AGE_SECONDS,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
 
 
 @router.get("/callback", name="manifest_callback")
-def manifest_callback(code: Annotated[str, Query()]) -> RedirectResponse:
-    """Exchange the manifest code for credentials and persist them."""
+def manifest_callback(
+    code: Annotated[str, Query()],
+    state: Annotated[str | None, Query()] = None,
+    manifest_state: Annotated[str | None, Cookie(alias=_STATE_COOKIE)] = None,
+) -> RedirectResponse:
+    """Exchange the manifest code for credentials and persist them.
+
+    The ``state`` GitHub echoes back must match the cookie set by ``/manifest/start``;
+    otherwise the callback is rejected before any credential is fetched or written.
+    """
+    if not state or not manifest_state or not secrets.compare_digest(state, manifest_state):
+        raise HTTPException(status_code=400, detail="invalid manifest state")
+
     settings = get_settings()
     credentials = exchange_manifest_code(code)
     persist_credentials(
@@ -72,7 +96,9 @@ def manifest_callback(code: Annotated[str, Query()]) -> RedirectResponse:
         private_key_path=settings.github_private_key_path or _DEFAULT_KEY_PATH,
         env_path=_ENV_PATH,
     )
-    return RedirectResponse(url="/manifest/success", status_code=303)
+    response = RedirectResponse(url="/manifest/success", status_code=303)
+    response.delete_cookie(_STATE_COOKIE)
+    return response
 
 
 @router.get("/success", response_class=HTMLResponse)
