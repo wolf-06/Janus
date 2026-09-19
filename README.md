@@ -56,6 +56,14 @@ App's webhook URL at `POST /webhooks/github`:
 The Phase 1 manifest flow (`/manifest/start`) creates the App and stores its
 credentials; the webhook secret must match `JANUS_GITHUB_WEBHOOK_SECRET`.
 
+To exercise signature verification and persistence without GitHub, post a signed
+`workflow_run` payload with the bundled script:
+
+```bash
+JANUS_GITHUB_WEBHOOK_SECRET=<secret> \
+  uv run python scripts/post_test_webhook.py --url http://localhost:8000/webhooks/github
+```
+
 ## Installing the GitHub App (manifest flow)
 
 1. Start a tunnel and set `JANUS_PUBLIC_URL` to its HTTPS URL in `.env`.
