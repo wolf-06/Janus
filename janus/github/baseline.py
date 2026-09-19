@@ -1,13 +1,17 @@
 """Baseline (last-green) resolution for the fault diff.
 
 To show *what changed* between a passing and failing build, we need a base commit. The
-provisional definition (``docs/IMPLEMENTATION_PLAN.md`` §5 Q2) is **the previous
-successful workflow run on the same branch**. GitHub returns runs newest-first, so the
-first completed ``success`` that is not the failing head is the most recent green.
+definition (``docs/IMPLEMENTATION_PLAN.md`` §5 Q2) is **the previous successful workflow
+run on the same branch**, validated to be an ancestor of the failing head.
 
-Caveat: this does not verify that the green run is an ancestor of the failing head. A
-force-push or a rebase could make "most recent success on the branch" diverge from the
-true last-green ancestor. The merge-base-with-default-branch alternative is deferred.
+GitHub returns runs newest-first, so the first completed ``success`` that is not the
+failing head is the most recent green. That candidate is then confirmed with the compare
+API: only a base that is ``ahead`` (head ahead of base) or ``identical`` is a true
+ancestor. A ``diverged``/``behind`` base means the branch was force-pushed or rebased and
+the diff would be meaningless, so we return ``None`` (unknown) rather than guess.
+
+If the compare call itself fails (network, oversized diff), we keep the candidate:
+losing the diff is worse than a best-effort base, and the failure is non-fatal.
 """
 
 from __future__ import annotations
@@ -15,9 +19,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import httpx
+
 from janus.github.client import GitHubClient
 
 _GREEN = "success"
+_ANCESTOR_STATUSES = frozenset({"ahead", "identical"})
 
 
 def select_baseline_sha(runs: Sequence[Mapping[str, Any]], *, head_sha: str) -> str | None:
@@ -36,6 +43,12 @@ def select_baseline_sha(runs: Sequence[Mapping[str, Any]], *, head_sha: str) -> 
     return None
 
 
+def is_ancestor(client: GitHubClient, owner: str, repo: str, base: str, head: str) -> bool:
+    """Whether ``base`` is an ancestor of ``head`` per the compare API."""
+    data = client.compare_commits(owner, repo, base, head)
+    return data.get("status") in _ANCESTOR_STATUSES
+
+
 def resolve_baseline(
     client: GitHubClient,
     owner: str,
@@ -44,6 +57,14 @@ def resolve_baseline(
     branch: str,
     head_sha: str,
 ) -> str | None:
-    """Fetch recent completed runs on ``branch`` and pick the last-green baseline."""
+    """Pick the last-green baseline on ``branch`` and confirm it is an ancestor of head."""
     runs = client.list_workflow_runs(owner, repo, branch=branch, status="completed")
-    return select_baseline_sha(runs, head_sha=head_sha)
+    candidate = select_baseline_sha(runs, head_sha=head_sha)
+    if candidate is None:
+        return None
+    try:
+        if not is_ancestor(client, owner, repo, candidate, head_sha):
+            return None
+    except httpx.HTTPError:
+        return candidate
+    return candidate
