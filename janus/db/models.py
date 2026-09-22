@@ -17,12 +17,14 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
     Integer,
     MetaData,
     String,
+    Text,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -117,6 +119,12 @@ class Job(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     cost_minutes: Mapped[float] = mapped_column(Float, default=0.0)
     llm_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Deduplicates enqueue: one job per key (defaults to the run id). A redelivered
+    # webhook or a re-enqueue returns the existing job instead of creating a second.
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    # Earliest time a worker may claim this job; set by exponential backoff on retry.
+    run_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -140,3 +148,19 @@ class Diagnosis(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     job: Mapped[Job] = relationship(back_populates="diagnoses")
+
+
+class SystemFlag(Base):
+    """A runtime toggle, e.g. the global kill switch.
+
+    Stored in the database (not only env) so it can be flipped while workers run and
+    take effect on the next claim, without a redeploy.
+    """
+
+    __tablename__ = "system_flags"
+
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
