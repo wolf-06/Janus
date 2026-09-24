@@ -42,6 +42,23 @@ class Settings(BaseSettings):
     github_client_id: str | None = None
     github_client_secret: str | None = None
 
+    # --- Orchestrator guardrails (Phase 2) ---
+    # Hard stop for all workers, independent of the DB kill switch. Handy for tests and
+    # for taking the fleet down without touching the database.
+    kill_switch: bool = False
+    # Retries before a job is left FAILED instead of requeued.
+    max_job_attempts: int = 3
+    # Cost caps: exceeding any of these routes a job to COMMENT_ONLY.
+    max_sandbox_minutes: float = 30.0
+    max_llm_tokens: int = 200_000
+    max_fix_retries: int = 3
+    # Per-repo quota: at most N jobs enqueued per repo in a rolling window.
+    repo_quota_max_jobs: int = 50
+    repo_quota_window_minutes: int = 60
+    # Worker loop cadence and retry backoff base (seconds).
+    worker_poll_interval_seconds: float = 5.0
+    worker_backoff_base_seconds: float = 30.0
+
 
 @lru_cache
 def get_settings() -> Settings:
