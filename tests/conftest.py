@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from janus.app.config import get_settings
-from janus.db.models import Base
+from janus.db.models import Base, Run
+from janus.db.repository import get_or_create_run, upsert_installation, upsert_repository
 from janus.github.app_auth import clear_token_cache
 
 
@@ -49,7 +50,37 @@ def engine() -> Iterator[Engine]:
 
 
 @pytest.fixture
-def session(engine: Engine) -> Iterator[Session]:
-    factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-    with factory() as session:
+def session_factory(engine: Engine) -> sessionmaker[Session]:
+    """A factory that hands out fresh sessions bound to the test engine."""
+    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+@pytest.fixture
+def session(session_factory: sessionmaker[Session]) -> Iterator[Session]:
+    with session_factory() as session:
         yield session
+
+
+@pytest.fixture
+def seeded_run(session: Session) -> Run:
+    """An installation + repository + failed run, committed, ready to enqueue against."""
+    upsert_installation(session, installation_id=1, account="acme", app_id=1)
+    upsert_repository(
+        session,
+        repo_id=2,
+        owner="acme",
+        name="widgets",
+        default_branch="main",
+        installation_id=1,
+    )
+    run, _ = get_or_create_run(
+        session,
+        run_id=3,
+        repo_id=2,
+        head_sha="sha",
+        head_branch="main",
+        conclusion="failure",
+        event="push",
+    )
+    session.commit()
+    return run
