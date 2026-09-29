@@ -84,6 +84,9 @@ def _mock_github() -> respx.Route:
             },
         )
     )
+    respx.get(f"{GITHUB_API_BASE}/repos/acme/widgets/compare/greensha...redsha").mock(
+        return_value=httpx.Response(200, json={"status": "ahead"})
+    )
     return respx.post(f"{GITHUB_API_BASE}/repos/acme/widgets/check-runs").mock(
         return_value=httpx.Response(201, json={"id": 1})
     )

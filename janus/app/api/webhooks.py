@@ -20,7 +20,6 @@ from starlette.concurrency import run_in_threadpool
 
 from janus.app.config import Settings, get_settings
 from janus.db.repository import (
-    create_job,
     get_or_create_run,
     set_run_baseline,
     upsert_installation,
@@ -31,6 +30,7 @@ from janus.github.app_auth import installation_token
 from janus.github.baseline import resolve_baseline
 from janus.github.client import GitHubClient
 from janus.github.webhook_verify import verify_signature
+from janus.jobs.queue import enqueue
 from janus.report.check_run import start_check_run
 
 router = APIRouter()
@@ -122,6 +122,6 @@ def _handle_workflow_run(
     with GitHubClient(token) as client:
         baseline = resolve_baseline(client, owner, name, branch=branch, head_sha=head_sha)
         set_run_baseline(session, run.run_id, baseline)
-        create_job(session, run_id=run.run_id)
+        enqueue(session, run_id=run.run_id)
         start_check_run(client, owner, name, head_sha=head_sha)
     session.commit()

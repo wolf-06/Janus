@@ -12,8 +12,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from janus.db.models import Diagnosis, Installation, Job, Repository, Run
-from janus.jobs.state import JobStatus
+from janus.db.models import Diagnosis, Installation, Repository, Run
 
 
 def upsert_installation(
@@ -123,14 +122,6 @@ def set_run_baseline(session: Session, run_id: int, baseline_sha: str | None) ->
     run.baseline_sha = baseline_sha
     session.flush()
     return run
-
-
-def create_job(session: Session, *, run_id: int) -> Job:
-    """Create a queued job for a run."""
-    job = Job(run_id=run_id, status=JobStatus.QUEUED.value)
-    session.add(job)
-    session.flush()
-    return job
 
 
 def create_diagnosis(
