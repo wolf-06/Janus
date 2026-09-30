@@ -8,6 +8,20 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: janus
+          POSTGRES_PASSWORD: janus
+          POSTGRES_DB: janus
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U janus"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -29,4 +43,7 @@ jobs:
         run: uv run mypy janus
 
       - name: Tests
+        env:
+          # Enables the SKIP LOCKED concurrency integration test against the service.
+          JANUS_TEST_DATABASE_URL: postgresql+psycopg://janus:janus@localhost:5432/janus
         run: uv run pytest -q
