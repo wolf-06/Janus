@@ -1,5 +1,5 @@
 # Local infrastructure. The app connects via JANUS_DATABASE_URL; the defaults below
-# match the URL in .env.example (postgresql+psycopg://janus:janus@localhost:5432/janus).
+# match the URL in .env.example (postgresql+asyncpg://janus:janus@localhost:5432/janus).
 services:
   postgres:
     image: postgres:16

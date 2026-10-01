@@ -1,8 +1,8 @@
-"""s0 schema: installations, repositories, runs, jobs, diagnoses
+"""initial schema (S0 + durable pipeline)
 
-Revision ID: 662bf7d4c2a9
+Revision ID: 89b3f474eac7
 Revises:
-Create Date: 2026-10-12 04:03:39.269699
+Create Date: 2026-10-20 14:22:00.262230
 
 """
 
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "662bf7d4c2a9"
+revision: str = "89b3f474eac7"
 down_revision: str | Sequence[str] | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -42,6 +42,18 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.PrimaryKeyConstraint("installation_id", name=op.f("pk_installations")),
+    )
+    op.create_table(
+        "system_flags",
+        sa.Column("name", sa.String(length=64), nullable=False),
+        sa.Column("enabled", sa.Boolean(), nullable=False),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("name", name=op.f("pk_system_flags")),
     )
     op.create_table(
         "repositories",
@@ -75,6 +87,26 @@ def upgrade() -> None:
         op.f("ix_repositories_installation_id"), "repositories", ["installation_id"], unique=False
     )
     op.create_table(
+        "deliveries",
+        sa.Column("delivery_id", sa.String(length=64), nullable=False),
+        sa.Column("repo_id", sa.BigInteger(), nullable=False),
+        sa.Column("event", sa.String(length=64), nullable=False),
+        sa.Column(
+            "received_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["repo_id"],
+            ["repositories.repo_id"],
+            name=op.f("fk_deliveries_repo_id_repositories"),
+            ondelete="CASCADE",
+        ),
+        sa.PrimaryKeyConstraint("delivery_id", name=op.f("pk_deliveries")),
+    )
+    op.create_index(op.f("ix_deliveries_repo_id"), "deliveries", ["repo_id"], unique=False)
+    op.create_table(
         "runs",
         sa.Column("run_id", sa.BigInteger(), autoincrement=False, nullable=False),
         sa.Column("repo_id", sa.BigInteger(), nullable=False),
@@ -83,7 +115,6 @@ def upgrade() -> None:
         sa.Column("conclusion", sa.String(length=32), nullable=False),
         sa.Column("baseline_sha", sa.String(length=64), nullable=True),
         sa.Column("event", sa.String(length=64), nullable=False),
-        sa.Column("delivery_id", sa.String(length=64), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -97,15 +128,22 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("run_id", name=op.f("pk_runs")),
-        sa.UniqueConstraint("delivery_id", name=op.f("uq_runs_delivery_id")),
     )
     op.create_index(op.f("ix_runs_repo_id"), "runs", ["repo_id"], unique=False)
     op.create_table(
         "jobs",
         sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("delivery_id", sa.String(length=64), nullable=False),
+        sa.Column("repo_id", sa.BigInteger(), nullable=False),
         sa.Column("run_id", sa.BigInteger(), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False),
+        sa.Column("fingerprint", sa.String(length=64), nullable=True),
+        sa.Column("state", sa.String(length=32), nullable=False),
         sa.Column("attempts", sa.Integer(), nullable=False),
+        sa.Column("max_attempts", sa.Integer(), nullable=False),
+        sa.Column("run_after", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("locked_by", sa.String(length=128), nullable=True),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("cost_minutes", sa.Float(), nullable=False),
         sa.Column("llm_tokens", sa.Integer(), nullable=False),
         sa.Column(
@@ -120,12 +158,36 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["delivery_id"],
+            ["deliveries.delivery_id"],
+            name=op.f("fk_jobs_delivery_id_deliveries"),
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["repo_id"],
+            ["repositories.repo_id"],
+            name=op.f("fk_jobs_repo_id_repositories"),
+            ondelete="CASCADE",
+        ),
         sa.ForeignKeyConstraint(
             ["run_id"], ["runs.run_id"], name=op.f("fk_jobs_run_id_runs"), ondelete="CASCADE"
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_jobs")),
+        sa.UniqueConstraint("delivery_id", name=op.f("uq_jobs_delivery_id")),
     )
+    op.create_index(op.f("ix_jobs_repo_id"), "jobs", ["repo_id"], unique=False)
     op.create_index(op.f("ix_jobs_run_id"), "jobs", ["run_id"], unique=False)
+    op.create_index(op.f("ix_jobs_state"), "jobs", ["state"], unique=False)
+    op.create_index(
+        "uq_jobs_active_fingerprint",
+        "jobs",
+        ["fingerprint"],
+        unique=True,
+        postgresql_where=sa.text("state IN ('queued','running')"),
+        sqlite_where=sa.text("state IN ('queued','running')"),
+    )
     op.create_table(
         "diagnoses",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -154,11 +216,22 @@ def downgrade() -> None:
     # ### commands auto generated by Alembic - please adjust! ###
     op.drop_index(op.f("ix_diagnoses_job_id"), table_name="diagnoses")
     op.drop_table("diagnoses")
+    op.drop_index(
+        "uq_jobs_active_fingerprint",
+        table_name="jobs",
+        postgresql_where=sa.text("state IN ('queued','running')"),
+        sqlite_where=sa.text("state IN ('queued','running')"),
+    )
+    op.drop_index(op.f("ix_jobs_state"), table_name="jobs")
     op.drop_index(op.f("ix_jobs_run_id"), table_name="jobs")
+    op.drop_index(op.f("ix_jobs_repo_id"), table_name="jobs")
     op.drop_table("jobs")
     op.drop_index(op.f("ix_runs_repo_id"), table_name="runs")
     op.drop_table("runs")
+    op.drop_index(op.f("ix_deliveries_repo_id"), table_name="deliveries")
+    op.drop_table("deliveries")
     op.drop_index(op.f("ix_repositories_installation_id"), table_name="repositories")
     op.drop_table("repositories")
+    op.drop_table("system_flags")
     op.drop_table("installations")
     # ### end Alembic commands ###

@@ -1,48 +1,53 @@
-"""Database engine and session management.
+"""Async database engine and session management.
 
-The engine is created lazily so importing this module (e.g. from tests or the app
-factory) never opens a connection. ``pool_pre_ping`` drops dead connections that
-Postgres or a proxy may have closed between requests.
+The engine is created lazily so importing this module never opens a connection.
+``pool_pre_ping`` drops dead connections. Sessions are async (asyncpg); Alembic keeps a
+separate synchronous engine (see ``migrations/env.py``).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 
-from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from janus.app.config import get_settings
 
-_engine: Engine | None = None
-_session_factory: sessionmaker[Session] | None = None
+_engine: AsyncEngine | None = None
+_session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
-def get_engine() -> Engine:
-    """Return the process-wide engine, creating it on first use."""
+def get_engine() -> AsyncEngine:
+    """Return the process-wide async engine, creating it on first use."""
     global _engine
     if _engine is None:
-        _engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+        _engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
     return _engine
 
 
-def _factory() -> sessionmaker[Session]:
+def _factory() -> async_sessionmaker[AsyncSession]:
     global _session_factory
     if _session_factory is None:
-        _session_factory = sessionmaker(bind=get_engine(), autoflush=False, expire_on_commit=False)
+        _session_factory = async_sessionmaker(
+            bind=get_engine(), autoflush=False, expire_on_commit=False
+        )
     return _session_factory
 
 
-def SessionLocal() -> Session:
-    """Return a new session bound to the engine (``sessionmaker`` style factory)."""
+def AsyncSessionLocal() -> AsyncSession:
+    """Return a new async session bound to the engine."""
     return _factory()()
 
 
-def get_session() -> Iterator[Session]:
-    """FastAPI dependency yielding a session that is always closed."""
-    session = SessionLocal()
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """FastAPI dependency yielding an async session that is always closed."""
+    session = AsyncSessionLocal()
     try:
         yield session
     finally:
-        session.close()
+        await session.close()

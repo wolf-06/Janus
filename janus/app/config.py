@@ -27,7 +27,8 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    database_url: str = "postgresql+psycopg://janus:janus@localhost:5432/janus"
+    # Async URL (asyncpg). Alembic rewrites the driver to psycopg for sync migrations.
+    database_url: str = "postgresql+asyncpg://janus:janus@localhost:5432/janus"
     log_level: str = "INFO"
 
     # Public base URL used to build the manifest redirect/webhook URLs. Unset locally
@@ -42,22 +43,30 @@ class Settings(BaseSettings):
     github_client_id: str | None = None
     github_client_secret: str | None = None
 
-    # --- Orchestrator guardrails (Phase 2) ---
-    # Hard stop for all workers, independent of the DB kill switch. Handy for tests and
-    # for taking the fleet down without touching the database.
+    # --- Orchestrator guardrails ---
+    # Hard stop for all workers, independent of the DB kill switch.
     kill_switch: bool = False
-    # Retries before a job is left FAILED instead of requeued.
-    max_job_attempts: int = 3
-    # Cost caps: exceeding any of these routes a job to COMMENT_ONLY.
+    # Retries before a job is dead-lettered.
+    max_job_attempts: int = 5
+    # Cost caps: exceeding any of these routes a job to skipped_budget.
     max_sandbox_minutes: float = 30.0
     max_llm_tokens: int = 200_000
     max_fix_retries: int = 3
     # Per-repo quota: at most N jobs enqueued per repo in a rolling window.
     repo_quota_max_jobs: int = 50
     repo_quota_window_minutes: int = 60
-    # Worker loop cadence and retry backoff base (seconds).
+    # Worker loop cadence and retry backoff (seconds).
     worker_poll_interval_seconds: float = 5.0
     worker_backoff_base_seconds: float = 30.0
+    worker_backoff_cap_seconds: float = 900.0
+    # Lease/heartbeat: a claim is valid for lease_seconds and is extended every
+    # heartbeat_interval_seconds. A reaper requeues jobs whose lease expired.
+    worker_lease_seconds: float = 60.0
+    worker_heartbeat_interval_seconds: float = 10.0
+    # Ingest backpressure: return 503 when the queued depth exceeds this.
+    queue_depth_limit: int = 10_000
+    # Phase-2 stub processor latency (seconds); replaced by the real brain in S1/S2.
+    stub_processing_seconds: float = 0.0
 
 
 @lru_cache
