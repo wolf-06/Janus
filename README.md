@@ -6,7 +6,9 @@ opens a PR.
 
 > Full plan: [`PLAN.md`](PLAN.md) · Architecture & build order:
 > [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) · Milestone spec:
-> [`docs/specs/S0.md`](docs/specs/S0.md) · Design notes:
+> [`docs/specs/S0.md`](docs/specs/S0.md) · Component reference:
+> [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · First principles:
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · Design notes:
 > [`docs/DECISIONS.md`](docs/DECISIONS.md)
 
 ## Status
@@ -36,6 +38,17 @@ Then check liveness:
 curl -s localhost:8000/health    # -> {"status":"ok"}
 ```
 
+## Running the worker
+
+The orchestrator consumes the `jobs` table. In a second terminal:
+
+```bash
+uv run python -m janus.jobs.worker
+```
+
+It enforces retries, cost caps, per-repo quotas and the kill switch. The Phase 2
+processor is a no-op placeholder; the reproduce/triage/fix pipeline lands in S1/S2.
+
 ## Quality
 
 ```bash
@@ -43,6 +56,13 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy janus
 uv run pytest -q
 uv run pre-commit install        # optional: run the same checks on commit
+```
+
+The `SKIP LOCKED` concurrency test needs Postgres:
+
+```bash
+JANUS_TEST_DATABASE_URL=postgresql+psycopg://janus:janus@localhost:5432/janus_test \
+  uv run pytest -q
 ```
 
 ## Receiving webhooks locally

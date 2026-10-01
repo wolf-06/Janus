@@ -340,9 +340,10 @@ failing head (``github/baseline.py``).
 **Alternatives.** Merge-base with the default branch — more correct across rebases, but
 needs extra API calls and ancestry checks.
 
-**Consequences.** (+) One API call; matches the provisional plan. (−) Does not verify the
-green run is an ancestor of the head; a force-push/rebase can mislead. Falls back to
-``None`` (unknown diff) rather than guessing. *Reversible:* yes.
+**Consequences.** (+) One API call; matches the provisional plan. (−) ~~Does not verify
+the green run is an ancestor of the head; a force-push/rebase can mislead.~~ **Resolved
+in the S0 closeout:** `resolve_baseline` now confirms ancestry via the compare API and
+returns ``None`` on divergence (see D-030). *Reversible:* yes.
 
 ---
 
@@ -372,9 +373,9 @@ S0.
 
 **Alternatives.** Store ``state`` in a signed cookie or DB row and verify on callback.
 
-**Consequences.** (−) A known gap: a malicious callback could be replayed. Low risk for a
-local, single-operator install; must be fixed before any hosted deployment. Tracked here
-so it is not silently forgotten. *Reversible:* yes.
+**Consequences.** (−) ~~A known gap: a malicious callback could be replayed.~~ **Resolved
+in the S0 closeout:** the state is bound to an HttpOnly cookie and verified on callback
+(see D-029). *Reversible:* yes.
 
 ---
 
@@ -407,3 +408,156 @@ more moving parts for S0. Block the event loop — would stall the server under 
 **Consequences.** (+) No event-loop blocking with a sync stack; 202 returns promptly.
 (−) One thread hop per failed run; negligible at S0 volume. *Reversible:* yes, and the
 call boundary is a single ``run_in_threadpool`` call.
+
+---
+
+## S0 closeout decisions
+
+### D-029 — Manifest ``state`` validated via an HttpOnly cookie
+
+**Context.** D-019 left the manifest ``state`` unvalidated: any callback could be replayed.
+
+**Decision.** ``/manifest/start`` sets the random ``state`` in an HttpOnly, SameSite=Lax
+cookie; ``/manifest/callback`` rejects the request (400) unless the echoed ``state``
+matches it, before fetching or writing any credential.
+
+**Alternatives.** A signed ``state`` value (itsdangerous) — unnecessary: ``state`` is a
+per-browser nonce, not a secret, so it only needs to match the cookie. A server-side
+store — state across restarts for no benefit at S0 scale.
+
+**Consequences.** (+) Closes the CSRF gap with no new dependency. (−) Requires cookies in
+the browser flow; fine for a browser-only endpoint. *Reversible:* yes.
+
+---
+
+### D-030 — Baseline ancestry verified with the compare API
+
+**Context.** D-017 accepted "most recent success on the branch" without checking that the
+green commit is an ancestor of the failing head; a force-push could make it unrelated.
+
+**Decision.** After selecting a candidate, confirm it with the compare API. Accept
+``ahead``/``identical``; on ``diverged``/``behind`` return ``None`` (unknown diff). A
+failed compare is non-fatal and keeps the candidate.
+
+**Alternatives.** Accept the candidate unchecked (D-017) — risks a meaningless diff.
+Hard-fail on a failed compare — loses the diff over a transient network error.
+
+**Consequences.** (+) The diff base is always an ancestor when we produce one. (−) One
+extra API call per failed run. *Reversible:* yes.
+
+---
+
+## Phase 2 decisions (orchestration)
+
+### D-031 — Postgres ``SKIP LOCKED`` queue instead of an external broker
+
+**Context.** Workers must claim jobs without double-processing, at low volume, with no
+extra infrastructure.
+
+**Decision.** A `jobs` table is the queue; `claim_next` uses
+`SELECT … FOR UPDATE SKIP LOCKED`. No Temporal/RabbitMQ/Celery.
+
+**Alternatives.** Temporal — durable workflows, but a whole service to run and operate.
+Celery/RabbitMQ — a broker and result backend for a ~50-line need. A plain `SELECT` +
+`UPDATE` — races under concurrency.
+
+**Consequences.** (+) The database is the queue: atomic, no new component, and the job
+row *is* the state. (+) Proven by a Postgres-gated test that two workers never claim the
+same job. (−) Not designed for tens of thousands of jobs/second; revisit at scale
+(`PLAN.md` §2 already defers Temporal). *Reversible:* the queue is two functions.
+
+---
+
+### D-032 — Idempotent enqueue via ``jobs.idempotency_key``
+
+**Context.** A redelivered webhook, a retry, or a re-run could enqueue duplicate work.
+
+**Decision.** `jobs.idempotency_key` is unique (default ``run:{run_id}``); `enqueue`
+returns the existing job instead of creating a second.
+
+**Alternatives.** Dedup only at the webhook (`runs.delivery_id`) — misses re-enqueues from
+other sources. No dedup — duplicate Check runs and duplicated cost.
+
+**Consequences.** (+) Enqueue is safe to call repeatedly; the unique constraint enforces
+it in the database. (−) A job is one-per-run by default; genuinely independent work needs
+a distinct key. *Reversible:* yes.
+
+---
+
+### D-033 — Kill switch stored in the database, env as a hard override
+
+**Context.** "Stops claiming immediately" rules out a config change that needs a restart.
+
+**Decision.** The switch is a `system_flags` row read on every claim; `Settings.kill_switch`
+is an env-level hard override for tests and fleet-wide shutdowns.
+
+**Alternatives.** Env-only — requires a restart, so not "immediate". A file sentinel —
+works but is awkward to set atomically across hosts.
+
+**Consequences.** (+) Runtime-toggleable, observable, and testable. (−) One indexed read
+per claim; negligible. *Reversible:* yes.
+
+---
+
+### D-034 — Caps and quotas degrade to ``COMMENT_ONLY``
+
+**Context.** An automated agent will burn unbounded time/tokens if unchecked
+(`PLAN.md` §4).
+
+**Decision.** Exceeding a cost cap or a per-repo quota routes the job to terminal
+``COMMENT_ONLY`` — report what was observed, spend nothing more.
+
+**Alternatives.** Fail the job — loses the partial result. Ignore the cap — unbounded
+spend, the exact failure mode the guardrail exists to prevent.
+
+**Consequences.** (+) Bounded spend and a safe, honest outcome. (−) A legitimate large
+job can be cut off; caps are configurable. *Reversible:* yes (defaults in `Settings`).
+
+---
+
+### D-035 — Retries via exponential backoff stored on ``run_after``
+
+**Context.** Transient failures should be retried, but hammering makes them worse, and
+retries must be bounded.
+
+**Decision.** On a retryable failure with `attempts < max_attempts`, set the job back to
+`QUEUED` with `run_after = now + base·2^(attempts-1)`; otherwise terminal `FAILED`.
+
+**Alternatives.** Immediate retry — thundering herd on a flaky dependency. Unbounded
+retries — never terminates, unbounded cost. An in-memory timer — lost on restart.
+
+**Consequences.** (+) Bounded, spaced retries that survive restarts. (−) Backoff delays
+recovery for genuinely transient blips; base is configurable. *Reversible:* yes.
+
+---
+
+### D-036 — The processor is a pluggable callable
+
+**Context.** The worker's mechanics are stable across milestones; the *method* changes.
+
+**Decision.** `JobProcessor = Callable[[Session, Job], JobResult]`. Phase 2 ships a no-op
+default; S1/S2 pass the real reproduce→triage→fix pipeline.
+
+**Alternatives.** Hard-code the pipeline in the loop — couples proven mechanics to
+unfinished logic. A class hierarchy — more ceremony than one function needs.
+
+**Consequences.** (+) Phase 2 is provably correct on its own and testable with fake
+processors; S1/S2 plug in without touching the loop. (−) A processor must report costs and
+retryability correctly for caps/backoff to work; the `JobResult` contract makes that
+explicit. *Reversible:* yes.
+
+---
+
+### D-037 — Processor exceptions are retryable, never fatal to the loop
+
+**Context.** A processor bug must not wedge the queue.
+
+**Decision.** `Worker._process` catches any exception and returns a retryable `FAILED`,
+which the normal bounded-retry path handles.
+
+**Alternatives.** Let it propagate — one bad job could crash the worker loop. Silently
+succeed — hides real failures.
+
+**Consequences.** (+) The loop is resilient; failures are recorded in `last_error` and
+bounded by `max_attempts`. (−) A deterministic bug burns `max_attempts` attempts before
+`FAILED`; acceptable and visible in logs. *Reversible:* yes.
