@@ -1,9 +1,25 @@
 # Janus — Development & Architecture Plan
 
-Source of truth: `PLAN.md` (a.k.a. `JANUS_PLAN.txt`). This document translates the
-product plan into an architecture and a phased build order. It does **not** replace
-`PLAN.md`; it implements it. Scope is **S0 + S1 + S2** only. No deferred item may be
-started before S2 is demoed.
+Sources of truth:
+
+1. `PLAN.md` (a.k.a. `JANUS_PLAN.txt`) — the **product** plan (S0–S2: reproduce, triage,
+   fix).
+2. `JANUS_BACKEND_SPEC-7def8ad9.md.txt` — the **backend** spec (durable, at-least-once,
+   idempotent pipeline; milestones D1–D6). Re-issued 2026-10-20; D1–D3 before triage
+   logic re-confirmed 2026-10-19.
+
+This document implements both. They cover different layers, so they compose rather than
+conflict: the product plan defines the *triage brain* (unchanged, behind
+`worker.process(job)`), and the backend spec defines the *pipeline* that carries it. Where
+they disagree about the pipeline (transport, queue, state names, deployables), **the
+backend spec wins**; those deltas and the reconciliations are recorded in §9.
+
+Two tracks:
+
+- **Product milestones** S0 → S1 → S2 (§2). S0 is done; Phase 2 (orchestration) is done
+  but is **superseded** by the backend track's D1–D3 (async, leases, dead-letter).
+- **Backend track** D1 → D6 (§8). D1–D3 must land before triage logic (Phase 4). Scope is
+  still S0 + S1 + S2; no `PLAN.md` §3 deferred item may start before S2 is demoed.
 
 ---
 
@@ -38,15 +54,18 @@ switch + per-repo quotas, and "no claim without a gate."
                      │  HMAC-signed events
                      ▼
    ┌─────────────────────────────────────────────┐
-   │  Ingress (FastAPI)                           │
-   │  manifest flow · webhook verify · enqueue    │
+   │  api (FastAPI deployable)                    │
+   │  manifest flow · HMAC verify ·               │
+   │  delivery dedup · enqueue · 503 backpressure │
    └───────────────┬─────────────────────────────┘
-                   │ jobs (Postgres, SKIP LOCKED)
+                   │ deliveries + jobs  (Postgres = source of truth)
+                   │ Redis = wake-up + rate-limit counters only
                    ▼
    ┌─────────────────────────────────────────────┐
-   │  Worker / Orchestrator                       │
-   │  job state machine · retries · cost caps ·   │
-   │  quotas · kill switch · idempotency          │
+   │  worker (deployable, N processes)            │
+   │  state machine · leases + reaper · retries   │
+   │  (full jitter) · dead-letter · fairness ·    │
+   │  rate limits · daily budgets · dedup · caps  │
    └───────────────┬─────────────────────────────┘
                    │
        ┌───────────┴────────────┬───────────────┐
@@ -75,10 +94,17 @@ switch + per-repo quotas, and "no claim without a gate."
 
 | Component | Responsibility | Milestone |
 |---|---|---|
-| **Ingress** | GitHub App manifest install, webhook HMAC verification, event filtering, job enqueue | S0 |
-| **GitHub client** | App JWT → installation token; fetch run logs, commits/diff, post Checks, PRs, comments | S0/S2 |
-| **Persistence** | Postgres schema + repository layer + Alembic migrations | S0 |
-| **Worker / orchestrator** | Postgres-backed queue, job state machine, retries/backoff, cost accounting, quotas, kill switch | S0→S2 |
+| **Ingress (api)** | GitHub App manifest install, webhook HMAC verification, delivery dedup, event filtering, transactional enqueue, 503 backpressure | S0 / D1 |
+| **GitHub client** | App JWT → installation token; fetch run logs, commits/diff, post Checks, PRs, comments; outbound token-bucket + 429 handling | S0/S2 / D4 |
+| **Persistence** | Postgres schema + async repository layer + Alembic migrations | S0 / D1 |
+| **Worker / orchestrator** | Postgres queue, state machine, leases + heartbeat + reaper, retries with full jitter, dead-letter, cost accounting, fairness, kill switch | S0→S2 / D1–D4 |
+| **Fairness + rate limiting** | fewest-running-per-repo claim, per-repo concurrency cap, per-installation GitHub token bucket (Redis) | D4 |
+| **Budgets** | per-repo daily sandbox-minute / LLM-token budget → `skipped_budget` | D4 |
+| **Failure dedup** | fingerprint normalize + cache verdict + partial unique index | D5 |
+| **Output idempotency** | hidden marker on Check runs/comments; update instead of duplicate | D2/D3 |
+| **Observability** | OTel traces, Prometheus metrics, JSON logs with ids, Grafana dashboard | D6 |
+| **Admin** | dead-letter listing + requeue endpoints | D3 |
+| **Load test** | locust/k6 harness + `bench/RESULTS.md` | D6 |
 | **Sandbox runner** | Ephemeral rootless Docker containers, profiles, mounts, network allowlist, resource caps, telemetry, log capture | S1 |
 | **Redaction** | Scrub secrets / `.env` / tokens / high-entropy strings before LLM/UI | S1 |
 | **Adapter interface** | Language-agnostic `Protocol`: discover targets, run tests, parse results, per-test coverage, mutate | S1 |
@@ -99,11 +125,13 @@ switch + per-repo quotas, and "no claim without a gate."
 
 ```
 janus/
-  app/            FastAPI entrypoint, config, health
-    api/          webhooks.py, manifest.py, health.py
-  github/         app_auth.py, client.py, webhook_verify.py, manifest.py
-  db/             models.py, session.py, repository.py, migrations/ (alembic)
-  jobs/           queue.py, worker.py, state.py, caps.py
+  app/            FastAPI deployable (the "api" process): entrypoint, config, health
+    api/          webhooks.py, manifest.py, health.py, admin.py
+  github/         app_auth.py, client.py, webhook_verify.py, manifest.py, ratelimit.py
+  db/             models.py, session.py (async), repository.py, migrations/ (alembic)
+  jobs/           the "worker" process: queue.py, worker.py, state.py, caps.py,
+                  lease.py (heartbeat + reaper), budgets.py, dedup.py, ratelimit.py
+  observability/  tracing.py (OTel), metrics.py (Prometheus)
   sandbox/        runner.py, profiles.py, telemetry.py, redaction.py, allowlist.py
   core/           language-agnostic engine
     reproducer.py
@@ -117,12 +145,26 @@ janus/
     adapter.py    Protocol / ABC
   adapters/
     python/       adapter.py, pytest_runner.py, coverage.py, mutmut.py
-  report/         check_run.py, comment.py, pr.py
+  report/         check_run.py, comment.py, pr.py, markers.py (output idempotency)
   config/         janus_yml.py
   benchmark/      bugs_in_py.py, metrics.py
-tests/            unit / integration / e2e
-docs/             IMPLEMENTATION_PLAN.md, specs/S0.md S1.md S2.md
+bench/            locust/k6 load scripts, RESULTS.md
+tests/            unit / integration (testcontainers) / chaos
+docs/             IMPLEMENTATION_PLAN.md, DESIGN.md, specs/S0.md S1.md S2.md
 ```
+
+**Mapping to the backend spec's §9 layout** (kept as one flat package to avoid a
+churny rename of the already-built S0 code; new modules are added under the existing
+names):
+
+| Backend spec | Here | Note |
+|---|---|---|
+| `api/` | `janus/app/` (+ `app/api/admin.py`) | FastAPI deployable |
+| `worker/` | `janus/jobs/` | claim loop, heartbeat, reaper, runner |
+| `core/` (models, queue ops, dedup, ratelimit, budgets) | `janus/db/`, `janus/jobs/{queue,dedup,budgets,ratelimit}.py`, `janus/github/ratelimit.py` | split by concern, not one folder |
+| `triage/` | `janus/core/*` + `janus/adapters/` | the language-agnostic brain + Python adapter |
+| `bench/` | `bench/` | new, at repo root |
+| `docs/DESIGN.md` | `docs/DESIGN.md` | new, required by spec §10 |
 
 Rule from `PLAN.md` §6: the **core stays language-agnostic**; every Python
 specific lives behind `core/adapter.py` in `adapters/python/`.
@@ -133,18 +175,34 @@ specific lives behind `core/adapter.py` in `adapters/python/`.
 |---|---|---|
 | `installations` | GitHub App installs | installation_id, account, app_id, scopes |
 | `repositories` | tracked repos + config | repo_id, owner/name, default_branch, `.janus.yml` cache |
+| `deliveries` | webhook deliveries (ingest idempotency) | delivery_id (`X-GitHub-Delivery`, PK), repo_id, event, received_at |
 | `runs` | observed workflow runs | run_id, repo_id, head_sha, conclusion, baseline_sha (last-green) |
-| `jobs` | work queue | id, run_id, status, attempts, cost_minutes, llm_tokens, timestamps |
+| `jobs` | work queue | id, delivery_id, repo_id, fingerprint, **state**, attempts, max_attempts, run_after, locked_by, lease_expires_at, last_error, created_at, finished_at |
 | `reproductions` | rerun evidence | job_id, profile, per-run result, exit code, telemetry JSON |
 | `signals` | scored evidence | job_id, signal_name, raw, normalized, weight |
 | `diagnoses` | triage outcome | job_id, route, confidence, top2_gap, evidence JSON |
 | `suspects` | SBFL/bisect output | job_id, file, line, score, introducing_commit |
 | `fixes` | generated diffs | job_id, suspect_id, diff, attempt, status |
 | `gate_results` | proof outcomes | fix_id, gate, passed, measured_value, baseline_value |
+| `budget_usage` | per-repo daily spend | repo_id, day, sandbox_minutes, llm_tokens |
 | `benchmark_runs` | BugsInPy harness | bug_id, predicted_route, actual, fix_rate, false_fix, t2g |
 
-Alembic owns all schema changes. `jobs` uses `SELECT ... FOR UPDATE SKIP LOCKED`
-for safe concurrent claiming.
+Notes (backend spec §4.2, §4.4, §4.3):
+
+- **Ingest idempotency** is `deliveries.delivery_id` (PK) with
+  `INSERT ... ON CONFLICT DO NOTHING`; the delivery row and the job row are written in
+  **one transaction** (spec §4.1).
+- **Claiming** uses `SELECT ... WHERE state='queued' AND run_after<=now()
+  ORDER BY run_after FOR UPDATE SKIP LOCKED LIMIT 1`.
+- **Leases**: a running job carries `locked_by` + `lease_expires_at`; a heartbeat extends
+  it, and a reaper requeues jobs whose lease expired (spec §4.2).
+- **Dedup**: a **unique partial index** on `jobs(fingerprint) WHERE state IN
+  ('queued','running')` coalesces concurrent duplicates (spec §4.4).
+- **States** are `queued → running → succeeded | failed | dead`, plus `skipped_budget`.
+  Route (`CODE_BUG`/`FLAKY`/`ENV`/`UNSURE`) lives on `diagnoses`, not on the queue state
+  (§9 R2).
+
+Alembic owns all schema changes.
 
 ---
 
@@ -171,12 +229,29 @@ migrations for installations/repositories/runs/jobs/diagnoses; enqueue on failed
 credentials; Check-run post mocked; diff computation correct; **E2E local: push a
 failing commit → Janus posts a Check run.**
 
-### Phase 2 — Orchestration core
-**Build:** job state machine, Postgres queue with `SKIP LOCKED`, worker loop,
-retry/backoff, idempotency keys; cost accounting (sandbox minutes, LLM tokens, fix
-retries); per-repo quotas; global kill switch.
-**Acceptance:** two workers never double-process a job; exceeding a cap routes to
-comment-only; kill switch stops claiming immediately; retries are bounded.
+### Phase 2 — Orchestration core *(done, superseded)*
+Built a synchronous Postgres queue: `SKIP LOCKED`, state machine, idempotency key, cost
+caps, per-repo quota, kill switch. This is **superseded by Phase 2R** (D1–D3), which
+converts it to async, adds leases/reaper, a dead-letter state, and per-delivery ingest
+idempotency. The Phase 2 rows and the rework are tracked in §8/§9 (R1, R2).
+
+### Phase 2R — Durable pipeline (backend D1–D3)
+**Build:** async SQLAlchemy + asyncpg; `deliveries` table with
+`INSERT ... ON CONFLICT DO NOTHING`; expanded `jobs` (state/lease/fingerprint columns);
+claim by `run_after` with `SKIP LOCKED`; worker pool with heartbeat + reaper; retries
+with **full jitter** (transient only); dead-letter state + admin routes; 503 backpressure
+on queue depth.
+**Acceptance (spec §6):** replay the same delivery 100× → one job (D1); `kill -9` a worker
+mid-job → job completes once, no duplicate output (D2); fault-injected GitHub/LLM (5xx /
+429 / timeouts) all recover, permanent faults land in `dead` with a reason (D3).
+
+### Phase 2F — Fairness, rate limits, budgets (backend D4)
+**Build:** fairness in the claim query (fewest running jobs per repo first), per-repo
+concurrency cap (default 2), Redis token-bucket per installation for outbound GitHub
+calls (respect `X-RateLimit-Remaining`/`Retry-After`; 429 requeues without burning an
+attempt), per-repo daily sandbox/LLM budgets → `skipped_budget` + comment.
+**Acceptance:** a noisy repo (500 jobs) does not delay a quiet repo's job beyond a stated
+bound; a 429 storm causes zero lost jobs.
 
 ### Phase 3 — Sandbox runner + adapter interface
 **Build:** rootless Docker runner (ephemeral, network-isolated with allowlist,
@@ -197,6 +272,16 @@ K/tau/epsilon.
 **Acceptance:** seed repo with a logic bug, a flaky test, and an infra break is labeled
 differently with evidence; confusion matrix over the seed set is sensible; `UNSURE`
 comments only; thresholds configurable.
+
+### Phase 4D — Failure dedup (backend D5)
+**Build:** `fingerprint = sha256(repo_id + workflow + normalized failing test ids +
+normalized top error lines)`; normalization strips timestamps, paths, hashes, line
+numbers. If an identical fingerprint was triaged within T hours and its commit range is
+unchanged, reuse the cached verdict and post a short "same failure as <run>" comment.
+Unique partial index on `(fingerprint) WHERE state IN ('queued','running')`; track
+`dedup_hits`.
+**Acceptance:** 100 identical failures → 1 triage + 99 cache hits; distinct failures are
+not merged (false-merge rate measured on the BugsInPy subset).
 
 ### Phase 5 — S2 Localize + Retrieve + Generate
 **Build:** SBFL (Ochiai/DStar) over per-test coverage contexts → ranked `file:line`;
@@ -223,6 +308,19 @@ force-push; comment rendering parity with PR body.
 **Acceptance:** suggest mode comments only; pr mode opens a PR with the verification
 table; assertions that no merge/force-push API path exists.
 
+### Phase 7O — Observability + load test (backend D6)
+**Build:** OpenTelemetry traces (one per delivery; spans for ingest, queue wait, claim,
+log fetch, sandbox, LLM, post; trace id propagated via the job row); Prometheus metrics
+(`jobs_enqueued`, `jobs_by_state`, `queue_age_seconds`, `job_duration_seconds` by stage,
+`retries_total`, `dead_total`, `dedup_hits`, `github_429_total`, `lease_reaped_total`);
+structured JSON logs with `delivery_id`/`job_id`/`repo_id`; Grafana dashboard JSON +
+screenshot; `locust`/`k6` load test committed with mock GitHub and a stub triage step
+(realistic latency) writing `bench/RESULTS.md`.
+**Acceptance:** traces/metrics/dashboard running; the load scenarios (steady, burst,
+worker-count sweep, kill-during-burst, injected 5xx/429) produce a report with ingest
+p50/p95/p99, queue-age p95, time-to-drain, throughput-vs-workers, and **0 lost / 0
+duplicated jobs**. Publish measured numbers only.
+
 ### Phase 8 — Benchmark + hardening + docs
 **Build:** BugsInPy subset harness (25–30 bugs); seed repo + one real repo;
 metrics: triage confusion matrix, fix rate, false-fix rate, mutation/coverage delta,
@@ -243,8 +341,11 @@ produce a proven PR.
 - **Testing strategy:** unit (signals, scorer, gates, policy, redaction, signature
   verify); integration (sandbox against a fixture repo); E2E (local webhook → Check);
   benchmark (BugsInPy subset).
-- **Observability:** structured logs, `jobs`/`diagnoses`/`gate_results` rows, cost
-  accounting per failure.
+- **Observability (backend spec §4.6):** structured JSON logs carrying
+  `delivery_id`/`job_id`/`repo_id`; `jobs`/`diagnoses`/`gate_results` rows and cost
+  accounting per failure; OpenTelemetry traces (one per delivery, trace id on the job
+  row); Prometheus metrics; a shipped Grafana dashboard. Only claim OTel/Prometheus on the
+  resume once they are actually running.
 - **Repo hygiene:** ruff, mypy, pytest, pre-commit, and a CI workflow for Janus itself.
 
 ---
@@ -263,26 +364,48 @@ produce a proven PR.
   is the safeguard; failed proof always degrades to a comment.
 - **Bisect cost:** bounded by sandbox-time caps; on cap, fall back to SBFL-only
   localization and lower confidence.
-- **Queue vs. Temporal:** intentionally a ~50-line Postgres job table; revisit only at
-  scale.
+- **Queue vs. Temporal:** intentionally a Postgres job table (now with leases + reaper);
+  revisit only at scale. Interview defense in `docs/DESIGN.md` (§10).
+- **Sync → async rework:** adopting async SQLAlchemy + `asyncpg` rewrites the Phase 2
+  code and moves integration tests to testcontainers; done before triage so the brain is
+  built on the final transport (§9 R1).
+- **Leases, not locks, for crash recovery:** a `kill -9` cannot release a row lock, so
+  correctness under crashes relies on lease expiry + a reaper, not on transactions alone.
+- **At-least-once + idempotent effects:** exactly-once is a non-goal; duplicates are made
+  harmless by delivery dedup, output markers, and the dedup fingerprint.
+- **Dedup false-merges:** over-eager normalization could merge genuinely distinct
+  failures; measured on the BugsInPy subset (D5).
+- **Redis is not on the critical path:** a flush must lose no jobs; polling fallback is
+  mandatory (§9 R5).
 
 ---
 
 ## 5. Open questions (to resolve at the relevant phase, not blockers)
 
 1. Which workflow events are authoritative — `workflow_run` (Actions) or `check_run`
-   (generic)? Plan implies Actions (`workflow_run`) with Check-run output. *(Phase 1)*
+   (generic)? Plan implies Actions (`workflow_run`) with Check-run output. *(Phase 1 —
+   resolved: Actions, `check_run` acknowledged not enqueued.)*
 2. Exact "last-green → first-red" baseline: previous successful run on the branch vs.
-   merge-base with default branch. *(Phase 1)*
+   merge-base with default branch. *(Phase 1 — resolved: previous success on the branch,
+   ancestry-verified.)*
 3. Which BugsInPy repos/bugs make the 25–30 subset. *(Phase 8)*
-4. Concrete default cost caps (sandbox minutes, LLM tokens, fix retries). *(Phase 2)*
+4. Concrete default cost caps (sandbox minutes, LLM tokens, fix retries). *(Phase 2 —
+   partly resolved: per-job caps exist; backend spec replaces these with per-repo **daily
+   budgets** → `skipped_budget`. Defaults still to confirm in Phase 2F.)*
+5. Backend spec §4.2 — `LISTEN/NOTIFY` vs Redis pubsub for wake-up, and whether Redis is
+   required or optional-with-polling-fallback. *(Phase 2R; recommendation: optional,
+   polling fallback required — §9 R5.)*
+6. Backend spec §4.4 — dedup window `T` and "commit range unchanged" semantics.
+   *(Phase 4D)*
 
 ---
 
 ## 6. Immediate next step
 
-Write `docs/specs/S0.md` with the acceptance tests above, then implement **Phase 0 →
-Phase 1**. Do not start any deferred item (`PLAN.md` §3) before S2 is demoed.
+S0 (Phases 0–1) and the synchronous Phase 2 are built. The next work is the backend
+track's **Phase 2R (D1–D3)**: `docs/specs/BACKEND.md`, then the durable pipeline
+(`deliveries` ingest, async DB, leases + reaper, dead-letter) — see §8 and §10. Do not
+start any deferred item (`PLAN.md` §3) before S2 is demoed.
 
 ---
 
@@ -301,7 +424,11 @@ stays `PLAN.md`; the architecture stays in §1 above.
 | Python | pin `3.12` (`uv python pin 3.12`), `requires-python = ">=3.12"` | System default is 3.14; ecosystem wheels (docker SDK, SQLAlchemy, mutmut) lag, so 3.12 is the safe floor. |
 | Packaging | flat `janus/` package at repo root | matches §1.3 layout exactly. |
 | HTTP | `httpx` (async), mocked with `respx` | GitHub client + tests. |
-| DB | Postgres 16 via `docker-compose.yml`; SQLAlchemy 2.0 (sync) + `psycopg[binary]`; Alembic | `SKIP LOCKED` works on sync; simplest for the ~50-line queue. |
+| DB | Postgres 16 via `docker-compose.yml`; **SQLAlchemy 2 async + `asyncpg`**; Alembic (sync `psycopg` for migrations) | backend spec §8 mandates async; one event loop serves api + worker I/O. Supersedes the S0 sync/`psycopg` choice (§9 R1). |
+| Cache / wake-up | **Redis 7**, optional | rate-limit counters + wake-up signal only; **never** the source of truth, polling fallback required (spec §3, §4.2). |
+| Observability | **OpenTelemetry** + **prometheus-client** | traces + metrics required by spec §4.6. |
+| Test DB | **testcontainers** (Postgres/Redis) for integration; pure-unit tests stay DB-free | spec §8; replaces SQLite for anything exercising real DB behaviour (§9 R6). |
+| Load test | **locust** or **k6** | spec §7; script + `bench/RESULTS.md` committed. |
 | Config | `pydantic-settings`, `JANUS_` env prefix | infra from env now; `.janus.yml` per-repo arrives in S1/S2. |
 | Logging | `structlog` (JSON) | structured logs required by §3. |
 | Quality | `ruff` (lint+format), `mypy` (strict on `janus/`), `pytest` (+`pytest-asyncio`, `respx`), `pre-commit` | §3 repo hygiene + CI. |
@@ -405,6 +532,11 @@ uv run pytest -q
 uv run uvicorn janus.app.main:app --reload   # then GET /health
 ```
 
+From **Phase 2R** onward the pipeline is async and runs as two deployables: the same
+commands still apply, but `docker compose up -d` brings up `postgres` + `redis` (and later
+`api`/`worker`/`prometheus`/`grafana`), and DB-touching integration tests run against
+**testcontainers** rather than SQLite (see §9 R1/R6).
+
 ### 7.6 Git workflow
 
 - Initial commit = the current plan docs (`PLAN.md`, `docs/`).
@@ -418,3 +550,148 @@ uv run uvicorn janus.app.main:app --reload   # then GET /health
    column — **recommend `.env` for S0**, document rotation.
 3. Test Postgres: `docker-compose` vs `testcontainers` — **recommend compose** for S0.
 4. Baseline definition (§5 Q2) — accept the provisional "previous successful run on branch".
+
+---
+
+## 8. Backend spec track (D1–D6)
+
+Converts the pipeline into a durable, at-least-once, idempotent service. Source:
+`JANUS_BACKEND_SPEC-7def8ad9.md.txt`. The triage brain is unchanged and sits behind
+`worker.process(job)`.
+
+### 8.1 Scope & non-goals (spec §1–§2)
+- **Goal:** handle webhook bursts from many repos with no lost events, no duplicate work,
+  bounded cost, and honest observability.
+- **Non-goals (state in README):** no microservices/Kafka/Kubernetes/service mesh; two
+  deployables only (`api`, `worker`) from one codebase; no exactly-once (at-least-once +
+  idempotent effects); one Postgres (no sharding). Stop after D6.
+
+### 8.2 D1 — Ingest + queue
+- `deliveries` table + migration; ingest writes delivery + job in **one transaction**.
+- Rewrite `POST /webhooks/github`: verify HMAC; `INSERT ... ON CONFLICT DO NOTHING` on
+  `delivery_id`; **duplicate → 200** (enqueue nothing), accepted → **202**, ignored → 202;
+  **503 + `Retry-After`** when queued jobs exceed the configured cap.
+- Expanded `jobs` schema (§1.4); async engine/session/repository.
+- Single async worker using the existing `SKIP LOCKED` claim.
+- **Accept:** replay the same delivery 100× → exactly one job; 202 path adds no triage work.
+
+### 8.3 D2 — Worker pool + leases
+- `locked_by`, `lease_expires_at`; heartbeat every 10 s extends the lease.
+- **Reaper** requeues `running` jobs whose lease expired (crashed worker).
+- Run N worker processes (same codebase) claiming via `SKIP LOCKED`.
+- **Accept:** `kill -9` a worker mid-job → the job completes exactly once with no
+  duplicate comment/check.
+
+### 8.4 D3 — Retries, DLQ, backoff
+- Classify errors: transient (GitHub 5xx/429, LLM timeout) → retry; permanent → `dead`.
+- Backoff with **full jitter**: `run_after = now + rand(0, min(cap, base*2^attempts))`.
+- Dead-letter: `state='dead'` + `GET /admin/dead` + `POST /admin/jobs/{id}/requeue`.
+- Fault-injecting fake GitHub/LLM (random 500/429/timeouts) for tests.
+- **Accept:** all transient faults recover; permanent faults land in `dead` with a reason.
+
+### 8.5 D4 — Fairness, rate limits, budgets
+- Claim query prefers the repo with the fewest running jobs; per-repo concurrency cap
+  (default 2).
+- Redis token-bucket per installation (Lua, atomic) for outbound GitHub calls; honour
+  `X-RateLimit-Remaining`/`Retry-After`; 429 → requeue with `run_after` without burning an
+  attempt.
+- Per-repo **daily budget** for sandbox minutes and LLM tokens; over budget →
+  `skipped_budget` + comment (not a failure).
+- **Accept:** a 500-job noisy repo does not delay a quiet repo's job beyond a stated
+  bound; a 429 storm loses zero jobs.
+
+### 8.6 D5 — Failure dedup
+- `fingerprint = sha256(repo_id + workflow + normalized failing test ids + normalized top
+  error lines)`; normalization strips timestamps, paths, hashes, line numbers.
+- Reuse the cached verdict when an identical fingerprint was triaged within T hours and
+  the commit range is unchanged; post a short "same failure as <run>" comment.
+- Unique **partial** index `(fingerprint) WHERE state IN ('queued','running')`; metric
+  `dedup_hits`.
+- **Accept:** 100 identical failures → 1 triage + 99 hits; distinct failures are not
+  merged (false-merge rate measured on the BugsInPy subset).
+
+### 8.7 D6 — Observability + load test
+- OTel traces (one per delivery; spans ingest/queue-wait/claim/log-fetch/sandbox/LLM/post;
+  trace id on the job row).
+- Prometheus metrics: `jobs_enqueued`, `jobs_by_state`, `queue_age_seconds`,
+  `job_duration_seconds` (by stage), `retries_total`, `dead_total`, `dedup_hits`,
+  `github_429_total`, `lease_reaped_total`.
+- JSON logs with `delivery_id`/`job_id`/`repo_id`; Grafana dashboard JSON + screenshot.
+- Load test (`locust`/`k6`) with mock GitHub + stub triage (log fetch 200–800 ms, LLM
+  3–10 s, sandbox 20–60 s); scenarios (a)–(e) from spec §7; results in `bench/RESULTS.md`.
+- **Accept:** report shows ingest p50/p95/p99, 202 rate, queue-age p95, time-to-drain,
+  throughput vs worker count, **0 duplicated / 0 lost jobs**; measured numbers only.
+
+### 8.8 Data-integrity invariants (write a test for each — spec §5)
+1. A delivery id is processed at most once to enqueue.
+2. A job is never run concurrently by two workers (lease + `SKIP LOCKED`).
+3. A worker crash at any point leaves exactly one visible effect.
+4. A retry never posts a duplicate comment/check (output marker).
+5. A Redis flush loses no jobs.
+
+### 8.9 Compose topology (spec §8)
+`docker compose up` brings up `api`, `worker`, `postgres`, `redis`, `prometheus`,
+`grafana`. Two deployables from one image; Redis and Grafana are optional for the
+polling-only local path (§9 R5).
+
+### 8.10 Deliverables
+- `docs/DESIGN.md` — decisions, tradeoffs, "Known limits", and answers to the spec §10
+  interview questions.
+- `bench/RESULTS.md` — the load report (bad numbers published with their cause).
+
+### 8.11 Phase ↔ milestone mapping
+
+| Backend milestone | Plan phase |
+|---|---|
+| D1 Ingest + queue | Phase 2R |
+| D2 Worker pool + leases | Phase 2R |
+| D3 Retries + DLQ + backoff | Phase 2R |
+| D4 Fairness + rate limits + budgets | Phase 2F |
+| D5 Dedup | Phase 4D |
+| D6 Observability + load test | Phase 7O |
+
+---
+
+## 9. Spec delta & reconciliation decisions
+
+Where the backend spec changes what already exists, these are the resolutions. Each is
+also an ADR candidate for `docs/DECISIONS.md` when implemented.
+
+- **R1 — Sync → async DB.** Adopt SQLAlchemy 2 async + `asyncpg` for `api` and `worker`;
+  keep a sync `psycopg` engine for Alembic only. Reworks `db/session.py`,
+  `db/repository.py`, `jobs/queue.py`, `jobs/worker.py`. *Cause:* spec §8; async I/O suits
+  the worker pool and heartbeats. *Cost:* the Phase 2 code is rewritten; tests move to
+  testcontainers Postgres.
+- **R2 — State vocabulary.** Adopt `queued/running/succeeded/failed/dead` +
+  `skipped_budget`; drop the local `claimed` (claim goes straight to `running` with a
+  lease) and `comment_only` (comment-only is *behaviour* driven by `diagnoses.route`, not
+  a queue state). Route stays in `diagnoses`.
+- **R3 — Layout.** Keep the flat `janus/` package (S0 is built); add `jobs/{lease,budgets,
+  dedup,ratelimit}.py`, `github/ratelimit.py`, `observability/`, `report/markers.py`,
+  `app/api/admin.py`, `bench/`, `docs/DESIGN.md`. Mapping table in §1.3.
+- **R4 — Ingest status codes.** Duplicate delivery → **200**; accepted → 202; ignored →
+  202; over queue depth → **503 + `Retry-After`**. Replaces S0's "202 for everything" and
+  moves idempotency from `runs.delivery_id` to the `deliveries` table.
+- **R5 — Redis is optional.** Used for wake-up and rate-limit counters only; the pipeline
+  must work with polling and no Redis. A Redis flush must lose no jobs (invariant 5).
+- **R6 — Tests use testcontainers.** Anything exercising real DB behaviour runs against a
+  containerized Postgres/Redis; pure-unit tests stay DB-free. Replaces the SQLite
+  integration approach.
+- **R7 — Guardrails compose.** Keep the global kill switch (`PLAN.md` §4); add the spec's
+  per-repo concurrency cap, daily budgets, and queue-depth backpressure. Per-job caps
+  (Phase 2) become budget accounting, not the primary limiter.
+- **R8 — Dedup needs the brain.** D5 depends on parsed failing-test ids and error lines,
+  so it is sequenced after Phase 4 (reproduce/triage), not with D1–D3.
+- **R9 — Output idempotency is new.** Check runs/comments carry a hidden marker with the
+  job's idempotency key; the reporter looks for it and updates instead of duplicating.
+  This closes the "crash between post and mark-succeeded" window (invariant 3/4).
+
+---
+
+## 10. Immediate next step
+
+Implement **Phase 2R (D1–D3)** before any triage logic: the `deliveries` table and
+ingest rewrite, the async DB migration, the expanded `jobs` schema, leases + reaper, and
+the dead-letter path with fault-injection tests. Write `docs/specs/BACKEND.md` first (the
+ordered task list + acceptance from §8.2–§8.4). Do not begin Phase 4 (triage) until D1–D3
+pass. Do not start any `PLAN.md` §3 deferred item before S2 is demoed.
