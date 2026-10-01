@@ -1,17 +1,21 @@
 """Job lifecycle: statuses and the transitions allowed between them.
 
-A job's status is the single source of truth for "what is being done with this failure".
-Encoding the legal transitions here (rather than in the worker) means an illegal move is
-a bug we can detect and test, not a silent corruption of the queue.
+A job's state is the single source of truth for "what is being done with this failure".
+Encoding the legal transitions here means an illegal move is a bug we can detect and
+test, not silent queue corruption.
 
 Shape of the machine::
 
-    QUEUED ──▶ CLAIMED ──▶ RUNNING ──▶ SUCCEEDED        (terminal)
-                  │           │
-                  │           ├──▶ FAILED             (terminal, retries exhausted)
-                  │           ├──▶ COMMENT_ONLY       (terminal, cap/quota/unsure)
-                  │           └──▶ QUEUED             (retry with backoff)
-                  └───────────────▶ QUEUED             (release: worker died / backoff)
+    QUEUED ──▶ RUNNING ──▶ SUCCEEDED
+                  │
+                  ├──▶ FAILED            (terminal, unclassified failure)
+                  ├──▶ DEAD              (terminal, permanent or retries exhausted)
+                  ├──▶ SKIPPED_BUDGET    (terminal, over a cost budget)
+                  └──▶ QUEUED            (retry with backoff, or lease reaped)
+
+There is no separate ``claimed`` state: a claim moves ``queued`` → ``running`` and sets a
+lease in the same statement. ``comment_only`` is not a state — whether a run is
+comment-only is behaviour driven by the triage route, not by the queue.
 """
 
 from __future__ import annotations
@@ -20,41 +24,43 @@ from enum import StrEnum
 
 
 class JobStatus(StrEnum):
-    """Lifecycle states for a work item."""
+    """Lifecycle states for a work item (backend spec §4.2)."""
 
     QUEUED = "queued"
-    CLAIMED = "claimed"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
-    COMMENT_ONLY = "comment_only"
+    DEAD = "dead"
+    SKIPPED_BUDGET = "skipped_budget"
 
 
 TERMINAL_STATUSES: frozenset[JobStatus] = frozenset(
-    {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.COMMENT_ONLY}
+    {
+        JobStatus.SUCCEEDED,
+        JobStatus.FAILED,
+        JobStatus.DEAD,
+        JobStatus.SKIPPED_BUDGET,
+    }
 )
 
+# States in which a job is still "active" — used by the dedup partial unique index.
+ACTIVE_STATUSES: frozenset[JobStatus] = frozenset({JobStatus.QUEUED, JobStatus.RUNNING})
+
 _ALLOWED_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
-    JobStatus.QUEUED: frozenset({JobStatus.CLAIMED}),
-    JobStatus.CLAIMED: frozenset(
-        {
-            JobStatus.RUNNING,
-            JobStatus.QUEUED,  # released back (crash, or a pre-run backoff)
-            JobStatus.FAILED,
-            JobStatus.COMMENT_ONLY,
-        }
-    ),
+    JobStatus.QUEUED: frozenset({JobStatus.RUNNING}),
     JobStatus.RUNNING: frozenset(
         {
             JobStatus.SUCCEEDED,
             JobStatus.FAILED,
-            JobStatus.QUEUED,  # retry with backoff
-            JobStatus.COMMENT_ONLY,
+            JobStatus.DEAD,
+            JobStatus.SKIPPED_BUDGET,
+            JobStatus.QUEUED,  # retry with backoff, or lease reaped after a crash
         }
     ),
     JobStatus.SUCCEEDED: frozenset(),
     JobStatus.FAILED: frozenset(),
-    JobStatus.COMMENT_ONLY: frozenset(),
+    JobStatus.DEAD: frozenset(),
+    JobStatus.SKIPPED_BUDGET: frozenset(),
 }
 
 

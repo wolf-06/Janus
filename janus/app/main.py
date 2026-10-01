@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from janus.app.api import health, manifest, webhooks
+from janus.app.api import admin, health, manifest, webhooks
 from janus.app.config import get_settings
 from janus.app.logging import configure_logging
 from janus.db.session import get_engine
@@ -26,7 +26,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        engine.dispose()
+        await engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -34,6 +34,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(webhooks.router)
     app.include_router(manifest.router)
+    app.include_router(admin.router)
     return app
 
 
