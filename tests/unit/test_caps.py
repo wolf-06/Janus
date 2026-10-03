@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from janus.db.models import Job
 from janus.jobs.caps import (
@@ -23,8 +23,9 @@ CAPS = Caps(max_sandbox_minutes=10.0, max_llm_tokens=1000)
 
 def _job(*, cost_minutes: float = 0.0, llm_tokens: int = 0) -> Job:
     return Job(
+        delivery_id="d",
+        repo_id=1,
         run_id=1,
-        idempotency_key="k",
         cost_minutes=cost_minutes,
         llm_tokens=llm_tokens,
     )
@@ -44,38 +45,40 @@ def test_llm_tokens_cap() -> None:
     assert reason is not None and "llm tokens" in reason
 
 
-def test_backoff_is_exponential() -> None:
-    assert backoff_seconds(1, 30.0) == 30.0
-    assert backoff_seconds(2, 30.0) == 60.0
-    assert backoff_seconds(3, 30.0) == 120.0
+def test_backoff_is_full_jitter() -> None:
+    # Ceiling is base * 2**attempts, capped; rng=1.0 returns the ceiling, 0.0 returns 0.
+    assert backoff_seconds(1, 30.0, 900.0, rng=lambda: 1.0) == 60.0
+    assert backoff_seconds(2, 30.0, 900.0, rng=lambda: 1.0) == 120.0
+    assert backoff_seconds(10, 30.0, 900.0, rng=lambda: 1.0) == 900.0  # capped
+    assert backoff_seconds(3, 30.0, 900.0, rng=lambda: 0.0) == 0.0
 
 
-def test_repo_quota_exceeded(session: Session, seeded_run: object) -> None:
-    for _ in range(2):
-        enqueue(session, run_id=3, idempotency_key=f"k{_}")
-    session.commit()
+async def test_repo_quota_exceeded(session: AsyncSession, seeded_run: object) -> None:
+    for i in range(2):
+        await enqueue(session, delivery_id=f"d{i}", repo_id=2, run_id=3)
+    await session.commit()
 
     quota = RepoQuota(max_jobs=1, window_minutes=60)
-    assert repo_quota_exceeded(session, 2, quota, now=datetime.now(UTC)) is True
+    assert await repo_quota_exceeded(session, 2, quota, now=datetime.now(UTC)) is True
 
     generous = RepoQuota(max_jobs=10, window_minutes=60)
-    assert repo_quota_exceeded(session, 2, generous, now=datetime.now(UTC)) is False
+    assert await repo_quota_exceeded(session, 2, generous, now=datetime.now(UTC)) is False
 
 
-def test_repo_quota_ignores_old_jobs(session: Session, seeded_run: object) -> None:
-    job = enqueue(session, run_id=3)
+async def test_repo_quota_ignores_old_jobs(session: AsyncSession, seeded_run: object) -> None:
+    job = await enqueue(session, delivery_id="d0", repo_id=2, run_id=3)
     job.created_at = datetime.now(UTC) - timedelta(hours=5)
-    session.commit()
+    await session.commit()
 
     quota = RepoQuota(max_jobs=0, window_minutes=60)
-    assert repo_quota_exceeded(session, 2, quota, now=datetime.now(UTC)) is False
+    assert await repo_quota_exceeded(session, 2, quota, now=datetime.now(UTC)) is False
 
 
-def test_kill_switch_toggles(session: Session) -> None:
-    assert is_kill_switch_engaged(session) is False
-    set_kill_switch(session, enabled=True)
-    session.commit()
-    assert is_kill_switch_engaged(session) is True
-    set_kill_switch(session, enabled=False)
-    session.commit()
-    assert is_kill_switch_engaged(session) is False
+async def test_kill_switch_toggles(session: AsyncSession) -> None:
+    assert await is_kill_switch_engaged(session) is False
+    await set_kill_switch(session, enabled=True)
+    await session.commit()
+    assert await is_kill_switch_engaged(session) is True
+    await set_kill_switch(session, enabled=False)
+    await session.commit()
+    assert await is_kill_switch_engaged(session) is False

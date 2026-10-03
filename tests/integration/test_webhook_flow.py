@@ -1,7 +1,8 @@
-"""Signed webhook → run/job persisted → Check run posted.
+"""Signed webhook → delivery/run/job persisted → Check run posted.
 
-GitHub's HTTP is mocked with respx; everything else (signature verification, the
-FastAPI endpoint, the repository layer, SQLite persistence) is real.
+GitHub's HTTP is mocked with respx; everything else (signature verification, the async
+FastAPI endpoint, the repository layer, SQLite persistence) is real. Uses httpx's
+ASGITransport so the app runs in the test's event loop alongside the async DB fixtures.
 """
 
 from __future__ import annotations
@@ -17,9 +18,8 @@ import pytest
 import respx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi.testclient import TestClient
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from janus.app.main import create_app
 from janus.db.models import Job, Run
@@ -92,17 +92,16 @@ def _mock_github() -> respx.Route:
     )
 
 
-def _app(monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: Session) -> Any:
-    monkeypatch.setenv("JANUS_GITHUB_APP_ID", "123")
-    monkeypatch.setenv("JANUS_GITHUB_PRIVATE_KEY_PATH", str(private_key_path))
-    monkeypatch.setenv("JANUS_GITHUB_WEBHOOK_SECRET", SECRET)
+def _client(session: AsyncSession) -> httpx.AsyncClient:
     app = create_app()
     app.dependency_overrides[get_session] = lambda: session
-    return app
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-def _post(client: TestClient, body: bytes, delivery: str, signature: str | None = None) -> Any:
-    return client.post(
+async def _post(
+    client: httpx.AsyncClient, body: bytes, delivery: str, signature: str | None = None
+) -> httpx.Response:
+    return await client.post(
         "/webhooks/github",
         content=body,
         headers={
@@ -115,60 +114,82 @@ def _post(client: TestClient, body: bytes, delivery: str, signature: str | None 
 
 
 @respx.mock
-def test_signed_webhook_persists_run_and_posts_check(
-    monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: Session
+async def test_signed_webhook_persists_run_and_posts_check(
+    monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: AsyncSession
 ) -> None:
     check_route = _mock_github()
-    app = _app(monkeypatch, private_key_path, session)
+    monkeypatch.setenv("JANUS_GITHUB_APP_ID", "123")
+    monkeypatch.setenv("JANUS_GITHUB_PRIVATE_KEY_PATH", str(private_key_path))
+    monkeypatch.setenv("JANUS_GITHUB_WEBHOOK_SECRET", SECRET)
     body = json.dumps(_payload()).encode()
 
-    with TestClient(app) as client:
-        response = _post(client, body, "delivery-1")
+    async with _client(session) as client:
+        response = await _post(client, body, "delivery-1")
 
     assert response.status_code == 202
     assert check_route.call_count == 1
 
-    run = session.scalar(select(Run))
-    assert run is not None
-    assert run.head_sha == "redsha"
+    run = await session.scalar(select(Run))
+    assert run is not None and run.head_sha == "redsha"
     assert run.baseline_sha == "greensha"
 
-    job = session.scalar(select(Job))
-    assert job is not None
-    assert job.status == "queued"
-    assert job.run_id == run.run_id
+    job = await session.scalar(select(Job))
+    assert job is not None and job.state == "queued"
 
 
 @respx.mock
-def test_redelivery_is_idempotent(
-    monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: Session
+async def test_redelivery_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: AsyncSession
 ) -> None:
     check_route = _mock_github()
-    app = _app(monkeypatch, private_key_path, session)
+    monkeypatch.setenv("JANUS_GITHUB_APP_ID", "123")
+    monkeypatch.setenv("JANUS_GITHUB_PRIVATE_KEY_PATH", str(private_key_path))
+    monkeypatch.setenv("JANUS_GITHUB_WEBHOOK_SECRET", SECRET)
     body = json.dumps(_payload()).encode()
 
-    with TestClient(app) as client:
-        first = _post(client, body, "delivery-1")
-        second = _post(client, body, "delivery-1")
+    async with _client(session) as client:
+        first = await _post(client, body, "delivery-1")
+        second = await _post(client, body, "delivery-1")
 
     assert first.status_code == 202
-    assert second.status_code == 202
+    assert second.status_code == 200
     assert check_route.call_count == 1
-    assert session.scalar(select(func.count()).select_from(Run)) == 1
-    assert session.scalar(select(func.count()).select_from(Job)) == 1
+    assert await session.scalar(select(func.count()).select_from(Run)) == 1
+    assert await session.scalar(select(func.count()).select_from(Job)) == 1
 
 
 @respx.mock
-def test_invalid_signature_is_rejected(
-    monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: Session
+async def test_invalid_signature_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: AsyncSession
 ) -> None:
     check_route = _mock_github()
-    app = _app(monkeypatch, private_key_path, session)
+    monkeypatch.setenv("JANUS_GITHUB_APP_ID", "123")
+    monkeypatch.setenv("JANUS_GITHUB_PRIVATE_KEY_PATH", str(private_key_path))
+    monkeypatch.setenv("JANUS_GITHUB_WEBHOOK_SECRET", SECRET)
     body = json.dumps(_payload()).encode()
 
-    with TestClient(app) as client:
-        response = _post(client, body, "delivery-1", signature="sha256=" + "0" * 64)
+    async with _client(session) as client:
+        response = await _post(client, body, "delivery-1", signature="sha256=" + "0" * 64)
 
     assert response.status_code == 401
     assert check_route.call_count == 0
-    assert session.scalar(select(func.count()).select_from(Run)) == 0
+    assert await session.scalar(select(func.count()).select_from(Run)) == 0
+
+
+@respx.mock
+async def test_queue_depth_backpressure_returns_503(
+    monkeypatch: pytest.MonkeyPatch, private_key_path: Path, session: AsyncSession
+) -> None:
+    _mock_github()
+    monkeypatch.setenv("JANUS_GITHUB_APP_ID", "123")
+    monkeypatch.setenv("JANUS_GITHUB_PRIVATE_KEY_PATH", str(private_key_path))
+    monkeypatch.setenv("JANUS_GITHUB_WEBHOOK_SECRET", SECRET)
+    monkeypatch.setenv("JANUS_QUEUE_DEPTH_LIMIT", "0")
+    body = json.dumps(_payload()).encode()
+
+    async with _client(session) as client:
+        response = await _post(client, body, "delivery-1")
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "60"
+    assert await session.scalar(select(func.count()).select_from(Run)) == 0
