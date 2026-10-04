@@ -13,9 +13,11 @@ opens a PR.
 
 ## Status
 
-Phase 0 (scaffold) is complete; Phase 1 (S0 GitHub App spine) is in progress. S0 ends at
-a local webhook → Check run on a real red build. Reproduce, triage and fix (S1/S2) are
-out of scope until the S0 demo passes.
+The **backend pipeline** (D1–D3 of the backend spec) is built: idempotent ingest,
+a Postgres-as-queue with leases/heartbeat/reaper, retries with full jitter, dead-letter
+with admin requeue, cost caps, quotas and a kill switch. The triage brain (reproduce,
+classify, fix, PR) is stubbed behind `JobProcessor` and tracked in
+[`docs/FUTURE.md`](docs/FUTURE.md). Backend spec: [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md).
 
 ## Requirements
 
@@ -40,14 +42,25 @@ curl -s localhost:8000/health    # -> {"status":"ok"}
 
 ## Running the worker
 
-The orchestrator consumes the `jobs` table. In a second terminal:
+The orchestrator consumes the `jobs` table. In a second terminal (run several for a pool):
 
 ```bash
 uv run python -m janus.jobs.worker
 ```
 
-It enforces retries, cost caps, per-repo quotas and the kill switch. The Phase 2
-processor is a no-op placeholder; the reproduce/triage/fix pipeline lands in S1/S2.
+Each worker claims with `SELECT ... FOR UPDATE SKIP LOCKED`, stamps a lease, heartbeats
+while processing, and a reaper requeues jobs whose lease expired (so `kill -9` is safe).
+It enforces full-jitter retries, cost caps, per-repo quotas and the kill switch.
+
+Dead-letter admin endpoints:
+
+```bash
+curl -s localhost:8000/admin/dead
+curl -s -X POST localhost:8000/admin/jobs/<id>/requeue
+```
+
+The processor is a no-op stub; the reproduce/triage/fix brain plugs in at S1/S2
+(see `docs/FUTURE.md`).
 
 ## Quality
 
@@ -61,7 +74,7 @@ uv run pre-commit install        # optional: run the same checks on commit
 The `SKIP LOCKED` concurrency test needs Postgres:
 
 ```bash
-JANUS_TEST_DATABASE_URL=postgresql+psycopg://janus:janus@localhost:5432/janus_test \
+JANUS_TEST_DATABASE_URL=postgresql+asyncpg://janus:janus@localhost:5432/janus_test \
   uv run pytest -q
 ```
 

@@ -561,3 +561,122 @@ succeed — hides real failures.
 **Consequences.** (+) The loop is resilient; failures are recorded in `last_error` and
 bounded by `max_attempts`. (−) A deterministic bug burns `max_attempts` attempts before
 `FAILED`; acceptable and visible in logs. *Reversible:* yes.
+
+---
+
+## Backend pipeline decisions (D1–D3)
+
+These supersede parts of Phase 2 (D-031…D-037) and come from the backend spec.
+
+### D-038 — Async database (SQLAlchemy 2 async + asyncpg)
+
+**Context.** The backend spec mandates async; Phase 2 was sync (`psycopg`).
+
+**Decision.** `api` and `worker` use SQLAlchemy 2 async with `asyncpg`; Alembic keeps a
+sync engine by rewriting the driver to `psycopg`.
+
+**Alternatives.** Stay sync — simpler, but not the spec's stack and blocks the event loop
+for DB I/O. Two code paths — rejected.
+
+**Consequences.** (+) One async stack for api + worker; `db/session.py`, `repository.py`,
+`queue.py`, `worker.py` rewritten. (−) Async SQLAlchemy requires `greenlet`; tests use
+`aiosqlite`. *Reversible:* costly (rewrite).
+
+### D-039 — Ingest idempotency on a `deliveries` table
+
+**Context.** S0 deduped on `runs.delivery_id` and returned 202 for everything.
+
+**Decision.** A `deliveries` row keyed on `X-GitHub-Delivery` with
+`INSERT ... ON CONFLICT DO NOTHING`; delivery + run + job in one transaction. Duplicate →
+**200**; accepted → 202; over queue depth → **503 + `Retry-After`**.
+
+**Alternatives.** Keep run-level dedup — conflates the run with the delivery. Application
+check-then-insert — racy.
+
+**Consequences.** (+) Idempotency is enforced by the PK; status codes match the spec.
+(−) One more table. *Reversible:* yes.
+
+### D-040 — State vocabulary: no `claimed`, no `comment_only`
+
+**Context.** Phase 2 had `claimed` and `comment_only`.
+
+**Decision.** States are `queued → running → succeeded | failed | dead | skipped_budget`;
+a claim goes straight to `running` with a lease. Comment-only is *behaviour* driven by the
+triage route (`diagnoses.route`), not a queue state.
+
+**Alternatives.** Keep `claimed` — an extra state with no meaning now that a lease carries
+ownership. Keep `comment_only` — conflates outcome with queue state.
+
+**Consequences.** (+) The queue state is purely about scheduling; the triage outcome lives
+where it belongs. (−) The brain must map its route to a terminal state (a comment is
+`succeeded`). *Reversible:* yes.
+
+### D-041 — Leases + heartbeat + reaper for crash safety
+
+**Context.** A `kill -9` cannot release a row lock, so transaction-level correctness alone
+does not recover a crashed worker.
+
+**Decision.** A claim stamps `locked_by` + `lease_expires_at`; a background task extends
+the lease every few seconds; a reaper requeues running jobs whose lease expired (without
+consuming an attempt).
+
+**Alternatives.** Rely on transaction rollback — only works if the process survives to roll
+back. A separate lease service — unnecessary.
+
+**Consequences.** (+) Crash-safe recovery; `SKIP LOCKED` keeps reapers from double-requeuing.
+(−) A periodic reaper query; retries must tolerate one re-run. *Reversible:* yes.
+
+### D-042 — Full-jitter backoff and a dead-letter state
+
+**Context.** Phase 2 used deterministic exponential backoff and `comment_only` on
+exhaustion.
+
+**Decision.** `run_after = now + rand(0, min(cap, base·2^attempts))`; retries only on
+transient failures; exhaustion or a permanent failure → `dead`, with admin requeue.
+
+**Alternatives.** Fixed backoff — thundering herd. Unbounded retries — never terminates.
+
+**Consequences.** (+) Spaced retries, a bounded failure path, and an operator escape hatch.
+(−) Jitter makes timing non-deterministic (tests inject `rng`). *Reversible:* yes.
+
+### D-043 — Transaction discipline: process outside the transaction
+
+**Context.** Holding a transaction open across long processing would lock the row and block
+heartbeats.
+
+**Decision.** Claim commits immediately; processing runs with no open transaction; a
+separate task heartbeats; finalization is a new short transaction.
+
+**Alternatives.** Hold one transaction across processing — simpler but blocks heartbeats
+and lengthens lock time.
+
+**Consequences.** (+) Heartbeats work, locks are short, a crash is recoverable via the
+lease. (−) Finalization re-loads the job by id and must be idempotent w.r.t. state.
+*Reversible:* yes.
+
+### D-044 — Sync GitHub SDK run on a worker thread
+
+**Context.** The GitHub client uses sync `httpx`; the endpoint is async.
+
+**Decision.** Keep the sync client and call it via `run_in_threadpool` for the best-effort
+baseline + Check-run work; the DB layer stays async.
+
+**Alternatives.** Convert the client to `httpx.AsyncClient` — cleaner long-term, but churns
+the client and its tests for no correctness gain now.
+
+**Consequences.** (+) No event-loop blocking; ingest stays fast; the GitHub layer is
+unchanged. (−) A thread hop per failed run; revisit if the client becomes async.
+*Reversible:* yes.
+
+### D-045 — Squash migrations into one baseline
+
+**Context.** Pre-release; two migrations existed and the jobs table was reworked.
+
+**Decision.** Squash to a single `initial schema` migration.
+
+**Alternatives.** An incremental alter migration (rename `status`→`state`, drop
+`idempotency_key`, add lease columns) — more faithful history but fragile with no data to
+preserve.
+
+**Consequences.** (+) A clean baseline; `alembic check` clean. (−) History collapses
+pre-release; acceptable with no deployments. *Reversible:* no (once deployed).

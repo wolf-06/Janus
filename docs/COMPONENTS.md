@@ -65,7 +65,7 @@ isolated app and override dependencies.
 even when a dependency (the database, GitHub) is degraded; conflating the two would make
 an orchestrator kill a healthy process during a DB blip.
 
-### `api/webhooks.py` — ingress (the core of S0)
+### `api/webhooks.py` — ingress
 `POST /webhooks/github`, in order:
 
 1. **Verify** the HMAC over the *raw* body (`github/webhook_verify.py`). Re-serialising
@@ -74,21 +74,18 @@ an orchestrator kill a healthy process during a DB blip.
 2. **Filter**: only `workflow_run` with `action == "completed"` and a failure conclusion
    (`failure`/`timed_out`/`startup_failure`) is actionable. `check_run` events are
    acknowledged (202) but ignored — Janus posts Check runs itself, so reacting would loop.
-3. **Off-load**: the endpoint is `async` (to read the body) but the DB and `httpx` are
-   synchronous, so the real work runs via `run_in_threadpool`. The event loop is never
-   blocked and GitHub gets a fast 202.
-4. **Persist**: `upsert_installation`, `upsert_repository`, then `get_or_create_run`.
-5. **Idempotency**: `runs.delivery_id` (the `X-GitHub-Delivery` header) is unique. A
-   redelivered webhook returns the existing run and skips every side effect.
-6. **Baseline**: `resolve_baseline` finds the last-green commit for the fault diff.
-7. **Enqueue**: `jobs.queue.enqueue` creates the queued job (idempotent on the run).
-8. **Report**: `report.check_run.start_check_run` posts an `in_progress` Check run.
-9. One transaction is committed at the end.
+3. **Backpressure**: if queued depth ≥ `JANUS_QUEUE_DEPTH_LIMIT`, return **503 +
+   `Retry-After`** so GitHub redelivers instead of the queue growing unbounded.
+4. **One transaction**: `record_delivery` (`INSERT ... ON CONFLICT DO NOTHING` on
+   `deliveries`), then `upsert_installation` / `upsert_repository`, `get_or_create_run`,
+   and `enqueue`. A duplicate delivery → **200** and nothing enqueued; accepted → **202**.
+5. **After the commit (best-effort)**: resolve the baseline and post the acknowledgement
+   Check run. These call the **sync** GitHub SDK via `run_in_threadpool` (the DB layer is
+   async), and any failure is logged, never fatal to ingest.
 
-**Why this order:** verification and idempotency come before any external call, so a
-forged or duplicated delivery can never cause work. The Check run is the last step
-because it is the only externally visible claim, and it should only happen once the run
-and job are durably recorded.
+**Why this order:** verification, backpressure and idempotency come before any external
+call, so a forged or duplicated delivery can never cause work; the job is durably enqueued
+before any GitHub call, so a GitHub outage cannot lose the event.
 
 ### `api/manifest.py` — one-click App install
 `GET /manifest/start` renders a self-submitting HTML form (GitHub's manifest endpoint
@@ -142,28 +139,32 @@ records the non-secret values in `.env`, preserving comments and updating keys i
 ## 4. `janus/db` — persistence
 
 ### `models.py` — schema
-Five tables. GitHub's natural ids are the primary keys (`installation_id`, `repo_id`,
-`run_id`) because they are globally unique and stable, so they double as idempotency keys
-and remove a mapping layer.
+GitHub's natural ids are primary keys where they are globally unique and stable
+(`installation_id`, `repo_id`, `run_id`); internal tables use surrogate ids.
 
-- `installations`, `repositories`, `runs` (with `baseline_sha`, unique `delivery_id`).
-- `jobs`: `status`, `attempts`, `cost_minutes`, `llm_tokens`, unique `idempotency_key`,
-  `run_after` (backoff gate), `last_error`.
+- `deliveries` (`delivery_id` PK, repo_id, event, received_at) — **ingest idempotency**.
+- `installations`, `repositories`, `runs` (with `baseline_sha`).
+- `jobs`: `delivery_id` (unique), `repo_id`, `run_id`, `fingerprint`, `state`, `attempts`,
+  `max_attempts`, `run_after`, `locked_by`, `lease_expires_at`, `last_error`,
+  `cost_minutes`, `llm_tokens`, `created_at`/`updated_at`/`finished_at`.
 - `diagnoses`: triage outcome (route/confidence/evidence) — populated in S1.
 - `system_flags`: runtime toggles (the kill switch).
 
 A deterministic `naming_convention` keeps Alembic autogenerate stable. Natural-id PKs are
-`autoincrement=False` so Postgres does not create unused sequences.
+`autoincrement=False` so Postgres does not create unused sequences. `jobs` carries a
+**partial unique index** on `fingerprint` where `state IN ('queued','running')` (used by
+dedup, D5).
 
-### `session.py` — engine & sessions
-The engine is created **lazily** (importing never opens a connection), with
-`pool_pre_ping` to drop dead connections. `SessionLocal()` is the factory; `get_session()`
-is the FastAPI dependency that always closes the session.
+### `session.py` — async engine & sessions
+`create_async_engine` (asyncpg) is created **lazily** (importing never opens a connection)
+with `pool_pre_ping`. `AsyncSessionLocal()` is the factory; `get_session()` is the async
+FastAPI dependency that always closes the session. Alembic uses a sync `psycopg` URL
+derived from the same setting.
 
-### `repository.py` — typed CRUD
+### `repository.py` — typed async CRUD
 Upserts and inserts that **flush but never commit** — the caller owns the transaction.
-This is what lets one webhook delivery be one atomic unit and keeps idempotency decisions
-in a single place.
+`record_delivery` uses dialect-specific `INSERT ... ON CONFLICT DO NOTHING` and returns
+whether the row was newly inserted; that boolean is the ingest idempotency decision.
 
 ### `migrations/` — Alembic
 Schema changes are migrations only. `env.py` takes the URL from `Settings` (never
@@ -172,69 +173,80 @@ newly generated revisions so they are always lint-clean.
 
 ---
 
-## 5. `janus/jobs` — the orchestrator (Phase 2)
+## 5. `janus/jobs` — the orchestrator
 
 ### `state.py` — the state machine
 `JobStatus` is a `StrEnum`. The legal transitions are encoded as data:
 
 ```
-QUEUED ─▶ CLAIMED ─▶ RUNNING ─▶ SUCCEEDED | FAILED | COMMENT_ONLY   (terminal)
-   ▲          │          │
-   └──────────┴──────────┴──── QUEUED        (release / retry with backoff)
+QUEUED ─▶ RUNNING ─▶ SUCCEEDED | FAILED | DEAD | SKIPPED_BUDGET   (terminal)
+              │
+              └────▶ QUEUED        (retry with backoff, or lease reaped)
 ```
 
-`can_transition` / `assert_transition` make an illegal move a testable bug rather than
-silent queue corruption. Terminal states have no exits.
+There is no `claimed` state: a claim moves `queued → running` and stamps a lease in the
+same statement. `comment_only` is not a state — whether a run is comment-only is behaviour
+driven by the triage route. `can_transition` / `assert_transition` make an illegal move a
+testable bug; terminal states have no exits.
 
 ### `caps.py` — guardrails
 Four mechanisms answering one question — *"may this job keep going?"*:
 
 - **`cap_exceeded`** bounds a single job by sandbox minutes and LLM tokens. Exceeding one
-  is terminal `COMMENT_ONLY`: report what we have, spend no more.
-- **`repo_quota_exceeded`** bounds a repository (jobs per rolling window) so one noisy
-  repo cannot starve others. The count includes the job being claimed, so exactly
-  `max_jobs` are allowed.
-- **`is/set_kill_switch`** store the global stop in `system_flags`; because it is read on
-  every claim, flipping it takes effect immediately without a redeploy. `Settings.kill_switch`
-  is a hard env-level override.
-- **`backoff_seconds`** gives exponential retry spacing (`base * 2**(attempts-1)`).
+  is terminal `skipped_budget`: report what we have, spend no more.
+- **`repo_quota_exceeded`** bounds a repository (jobs per rolling window) so one noisy repo
+  cannot starve others. The count includes the job being claimed, so exactly `max_jobs`
+  are allowed. (D4 adds the fairness/concurrency-cap form.)
+- **`is/set_kill_switch`** store the global stop in `system_flags`; read on every claim, so
+  flipping it takes effect immediately without a redeploy. `Settings.kill_switch` is a hard
+  env-level override.
+- **`backoff_seconds`** gives **full-jitter** retry spacing:
+  `rand(0, min(cap, base·2^attempts))`.
 
-`max_fix_retries` is carried here for the S2 fix loop; Phase 2 does not consume it yet.
+`max_fix_retries` is carried here for the S2 fix loop.
 
 ### `queue.py` — the Postgres queue
-- `enqueue(session, run_id, idempotency_key=...)` dedupes on the key (default
-  `run:{run_id}`), returning the existing job if present.
-- `claim_next(session, now=...)` runs
-  `SELECT … WHERE status='queued' AND (run_after IS NULL OR run_after <= now)
-  ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`, then sets `CLAIMED` and increments
-  `attempts`. It **flushes but does not commit**.
+- `enqueue(session, delivery_id, repo_id, run_id, ...)` dedupes on `delivery_id` (one job
+  per delivery), returning the existing job if present.
+- `claim_next(session, worker_id, now, lease_seconds)` runs
+  `SELECT … WHERE state='queued' AND (run_after IS NULL OR run_after <= now)
+  ORDER BY run_after NULLS FIRST, id LIMIT 1 FOR UPDATE SKIP LOCKED`, then sets `running`,
+  increments `attempts`, and stamps `locked_by` + `lease_expires_at`. It **flushes but
+  does not commit**.
+- `queued_depth(session)` supports ingest backpressure.
 
-**Why SKIP LOCKED:** each worker locks the oldest eligible row and skips rows other
-workers have locked, so N workers are safe with no external lock service — the database
-*is* the queue. Flushing without committing means a crash mid-processing rolls the claim
-back and the job returns to `queued` on its own.
+**Why SKIP LOCKED:** each worker locks the oldest eligible row and skips rows other workers
+have locked, so N workers are safe with no external lock service — the database *is* the
+queue.
 
-### `worker.py` — the loop
-`Worker.run_once()` performs, in order:
+### `lease.py` — heartbeat and reaper
+A claim stamps a lease. `heartbeat` extends it if this worker still owns the job; a
+background task calls it every few seconds during processing. `reap_expired` returns
+running jobs whose lease expired to `queued` — the crash-recovery mechanism for `kill -9`
+(and it does **not** consume an attempt). `SKIP LOCKED` keeps two reapers from
+double-requeuing.
 
-1. **Kill switch** (settings or DB) → return without claiming.
-2. **Claim** the next eligible job (`QUEUED → CLAIMED → RUNNING`).
-3. **Quota**: over the per-repo limit → `COMMENT_ONLY`, commit, done.
-4. **Process** via the pluggable `JobProcessor`; any exception becomes a retryable
-   failure, so a buggy processor cannot wedge the queue.
-5. **Apply** cost accounting, then: cap exceeded → `COMMENT_ONLY`; retryable and under
-   `max_attempts` → back to `QUEUED` with `run_after = now + backoff`; else the terminal
-   status the processor asked for.
-6. **Commit**.
+### `worker.py` — the loop and transaction discipline
+`Worker.run_once()`:
 
-`run()` polls until `max_iterations` (tests) or forever (daemon, `python -m
-janus.jobs.worker`). The default processor is a Phase 2 no-op; the real
-reproduce→triage→fix pipeline slots in behind the same interface.
+1. **Claim** in a short transaction: kill switch check, then `claim_next`, then **commit**.
+2. **Quota**: over the per-repo limit → `skipped_budget`, done.
+3. **Process** via the pluggable async `JobProcessor` with **no open transaction**; a
+   background task heartbeats the lease. Any exception becomes a retryable failure.
+4. **Finalize** in another short transaction: add cost/tokens; cap exceeded →
+   `skipped_budget`; success → `succeeded`; retryable and under `max_attempts` → `queued`
+   with a jittered `run_after`; otherwise → `dead`.
 
-**Why the processor is a callable:** the *mechanics* (claiming, retries, caps, quotas,
-kill switch) are stable and testable; the *method* is what changes between milestones.
-Separating them means Phase 2 is provably correct on its own and S1/S2 plug in without
-touching the loop.
+`run()` reaps, then polls until `max_iterations` (tests) or forever (daemon,
+`python -m janus.jobs.worker`).
+
+**Why processing runs outside a transaction:** holding a transaction open across long work
+would lock the row and block heartbeats; instead the lease carries ownership, so a crash is
+recovered by the reaper rather than by a rollback that never happens.
+
+**Why the processor is a callable:** the *mechanics* (claiming, leases, retries, caps,
+quotas, kill switch) are stable and testable; the *method* is what changes between
+milestones. The triage brain plugs in at S1/S2 without touching the loop.
 
 ---
 
@@ -249,22 +261,36 @@ surfaces.
 
 ## 7. Cross-cutting behaviours
 
-- **Idempotency, twice.** Webhook redeliveries are deduped by `runs.delivery_id`; job
-  re-enqueues by `jobs.idempotency_key`. Both are unique constraints, so the guarantee is
-  enforced by the database, not by application logic alone.
-- **Transactions.** One webhook delivery = one transaction; one claim+process = one
-  transaction. Repositories flush, callers commit.
+- **Idempotency.** Webhook redeliveries are deduped by the `deliveries` PK; a job is
+  one-per-delivery (`jobs.delivery_id` unique). Both are database constraints, not
+  application checks.
+- **Transactions.** Ingest is one transaction (delivery + run + job). In the worker, a
+  claim and the finalization are each short transactions and processing runs between them
+  with no open transaction.
 - **Failure direction.** Every stage degrades *safe*: bad signature → 401 and no work;
-  over a cap/quota → `COMMENT_ONLY`; processor exception → bounded retry then `FAILED`;
-  unknown baseline → `None`. Nothing guesses.
+  saturated queue → 503 and GitHub redelivers; over a cap/quota → `skipped_budget`;
+  processor exception → bounded retry then `dead`; unknown baseline → `None`. Nothing
+  guesses.
+- **Crash safety.** Ownership is a lease, not a lock: a crashed worker's job is reaped
+  back to `queued`. See `docs/specs/BACKEND.md` §3.
 - **Observability.** Structured logs plus the `runs`/`jobs`/`diagnoses` rows record what
   happened and why, which is also what makes "no claim without a gate" possible later.
 
 ---
 
-## 8. Still stubbed (not part of S0/Phase 2)
+## 8. Still stubbed / deferred
 
-`janus/core/**` (reproducer, signals, triage, localize, retrieve, generate, prove,
-adapter), `janus/sandbox/**`, `janus/adapters/python/**`, `janus/report/{comment,pr}.py`,
-`janus/config/janus_yml.py`, `janus/benchmark/**`. The worker is wired to call them; they
-are empty until their phases.
+The triage brain and the rest of the backend track. See [`FUTURE.md`](FUTURE.md) for the
+full ledger. In short:
+
+- **Product brain (S1):** `janus/core/**` (reproducer, signals, triage), `janus/sandbox/**`,
+  `janus/adapters/python/**`, `janus/report/comment.py`, `janus/config/janus_yml.py`.
+- **Fix loop (S2):** `janus/core/{localize,retrieve,generate,prove}`, `janus/report/pr.py`.
+- **Backend D4–D6:** fairness/rate limits/budgets (`janus/jobs/{ratelimit,budgets}.py`),
+  dedup, observability (`janus/observability/`), load test (`bench/`), Redis, and
+  `docs/DESIGN.md`.
+- **Output idempotency marker:** `janus/report/markers.py` (needed before the brain posts
+  comments/checks).
+
+The worker is wired to call the brain via `JobProcessor`; these modules are empty until
+their phases.
