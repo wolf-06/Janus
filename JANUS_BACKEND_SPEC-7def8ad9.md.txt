@@ -1,0 +1,116 @@
+# Janus Backend Spec (updated 2026-10-20)
+
+> Version note: this is the same spec sent on 2026-10-16, re-issued current. No design changes since then; the build order below (D1-D3 before triage logic) was re-confirmed on 2026-10-19. The original spec body follows unchanged.
+
+# Janus Backend Spec: durable, at-least-once, idempotent triage pipeline
+
+Audience: coding agents building Janus. Scope: backend only. Triage logic (reproduce, classify, patch, proof gates) is unchanged and sits behind the worker's `process(job)` function.
+
+## 1. Goal
+Handle GitHub webhook bursts from many repos with no lost events, no duplicate work, bounded cost, and clear observability. Measured honestly, not claimed.
+
+## 2. Non-goals (say these out loud in the README)
+- No microservices, Kafka, Kubernetes, service mesh. Two deployables only: `api` and `worker`, same codebase.
+- No exactly-once claim. Delivery is at-least-once; effects are idempotent.
+- No horizontal DB sharding. One Postgres.
+
+## 3. Architecture
+```
+GitHub --webhook--> api (FastAPI)
+  verify HMAC -> persist delivery -> enqueue job -> 202
+                         |
+                 Postgres (source of truth: deliveries, jobs, results)
+                 Redis (rate-limit counters, wake-up signal only)
+                         |
+              worker pool (N processes, SKIP LOCKED claim)
+   fetch logs -> dedup check -> reproduce (sandbox) -> triage -> post Check run/comment
+```
+Decision: the Postgres `jobs` table is the queue. Redis is NOT the source of truth, so a Redis loss costs nothing but speed. (Defend this choice: one transactional store, jobs enqueue in the same transaction as the delivery record.)
+
+## 4. Components and requirements
+
+### 4.1 Webhook ingest (api)
+- `POST /webhooks/github`: verify `X-Hub-Signature-256` (constant-time compare). Reject 401 otherwise.
+- Idempotency key = `X-GitHub-Delivery`. `INSERT ... ON CONFLICT DO NOTHING` into `deliveries`. Duplicate returns 200 and enqueues nothing.
+- Only handle `workflow_run` with `conclusion=failure`; ignore the rest with 202.
+- In ONE transaction: insert delivery + insert job. Respond 202 in under 50 ms p99 at target load. No triage work in the request path.
+- Backpressure: if queued jobs exceed a configured cap, return 503 + `Retry-After` (GitHub redelivers).
+
+### 4.2 Queue (Postgres)
+`jobs(id, delivery_id, repo_id, fingerprint, state, attempts, max_attempts, run_after, locked_by, lease_expires_at, last_error, created_at, finished_at)`
+- States: `queued -> running -> succeeded | failed | dead`.
+- Claim: `SELECT ... WHERE state='queued' AND run_after<=now() ORDER BY run_after FOR UPDATE SKIP LOCKED LIMIT 1`.
+- Lease + heartbeat: worker extends `lease_expires_at` every 10 s. A reaper requeues `running` jobs whose lease expired (worker crash). This is the "kill -9 a worker" demo.
+- Retries: exponential backoff with full jitter, `run_after = now() + rand(0, min(cap, base*2^attempts))`. Retry only on transient errors (GitHub 5xx/429, LLM timeout). Permanent errors go straight to `dead`.
+- Dead-letter: `state='dead'` rows plus `GET /admin/dead` and `POST /admin/jobs/{id}/requeue`.
+- Optional wake-up: worker `LISTEN/NOTIFY` (or Redis pubsub) to avoid tight polling. Polling fallback must still work.
+
+### 4.3 Per-repo fairness and rate limiting
+- Fairness: claim query picks the repo with the fewest running jobs first, so one noisy repo cannot starve others. Cap concurrent jobs per repo (config, default 2).
+- Outbound GitHub API: token-bucket per installation in Redis (Lua script, atomic). Respect `X-RateLimit-Remaining` and `Retry-After`; on 429 requeue with `run_after`, do not burn an attempt.
+- Cost caps: per-repo daily budget for sandbox minutes and LLM tokens. Over budget -> job completes as `skipped_budget` with a comment, not a failure.
+
+### 4.4 Failure dedup
+- `fingerprint = sha256(repo_id + workflow + normalized failing test ids + normalized top error lines)`. Normalize: strip timestamps, paths, hashes, line numbers.
+- If an identical fingerprint was triaged in the last T hours and its commit range is unchanged, reuse the cached verdict and post a short "same failure as <run>" comment. Unique partial index on `(fingerprint) WHERE state IN ('queued','running')` coalesces concurrent duplicates into one job.
+- Track `dedup_hits` metric. This is real value, not decoration: CI failures repeat.
+
+### 4.5 Output idempotency
+- Check runs and comments carry a hidden marker with the job's idempotency key. Before posting, look for the marker; update instead of duplicating. A retry after a crash between "post" and "mark succeeded" must not double-post.
+
+### 4.6 Observability
+- OpenTelemetry traces: one trace per delivery, spans for ingest, queue wait, claim, log fetch, sandbox, LLM, post. Propagate trace id via the job row.
+- Prometheus metrics: `jobs_enqueued`, `jobs_by_state`, `queue_age_seconds` (oldest queued), `job_duration_seconds` by stage, `retries_total`, `dead_total`, `dedup_hits`, `github_429_total`, `lease_reaped_total`.
+- Structured JSON logs with `delivery_id`, `job_id`, `repo_id`.
+- Ship a Grafana dashboard JSON and a screenshot in the README. Only list OTel/Prometheus on the resume if they are really running.
+
+## 5. Data integrity invariants (write tests for each)
+1. A delivery id is processed at most once to enqueue.
+2. A job is never run concurrently by two workers (lease + SKIP LOCKED).
+3. Worker crash at any point leads to the job finishing exactly one visible effect.
+4. A retry never posts a duplicate comment/check.
+5. Redis flush loses no jobs.
+
+## 6. Milestones (each ends with passing tests and a README note)
+- **D1 Ingest + queue.** Signature check, delivery dedup, jobs table, single worker, 202 path. Accept: replay the same delivery 100x, one job.
+- **D2 Worker pool + leases.** N workers, SKIP LOCKED, heartbeat, reaper. Accept: kill -9 a worker mid-job, job completes once, no duplicate output.
+- **D3 Retries, DLQ, backoff.** Fault-injecting fake GitHub/LLM (random 500/429/timeouts). Accept: all transient faults recover; permanent faults land in dead with reason.
+- **D4 Fairness, rate limits, budgets.** Accept: noisy repo (500 jobs) does not delay a quiet repo's job beyond a stated bound; 429 storm causes zero lost jobs.
+- **D5 Dedup.** Accept: 100 identical failures produce 1 triage + 99 cache hits; distinct failures are not merged (test false-merge rate on the BugsInPy subset).
+- **D6 Observability + load test.** Traces, metrics, dashboard. Load test below.
+
+## 7. Load test (the honest part)
+- Tool: `locust` or `k6`, script committed to the repo, one command to run, results written to `bench/RESULTS.md`.
+- Mock GitHub and a stub triage step with realistic latency (log fetch 200-800 ms, LLM 3-10 s, sandbox 20-60 s) so you measure the pipeline, not the LLM. State this plainly.
+- Scenarios: (a) steady 5 webhooks/s for 10 min; (b) burst of 1,000 webhooks in 10 s across 50 repos with 20% duplicates; (c) same burst with workers = 1, 2, 4, 8; (d) kill workers during the burst; (e) 30% injected 5xx/429.
+- Report: ingest p50/p95/p99 latency, 202 rate, queue age p95, time-to-drain, throughput vs worker count (a scaling table), duplicates created (must be 0), jobs lost (must be 0), retries, dead count. Hardware and versions stated.
+- Do not publish a number you did not measure. Publish bad numbers with the cause.
+
+## 8. Stack
+Python 3.12, FastAPI, SQLAlchemy 2 async + asyncpg, Alembic, Postgres 16, Redis 7, httpx, pydantic v2, structlog, OpenTelemetry, prometheus-client, pytest + testcontainers, docker compose (`api`, `worker`, `postgres`, `redis`, `prometheus`, `grafana`).
+
+## 9. Repo layout
+```
+janus/
+  api/          # FastAPI app, webhook routes, admin routes
+  worker/       # claim loop, heartbeat, reaper, runner
+  core/         # models, queue ops, dedup, ratelimit, budgets
+  triage/       # existing Janus logic behind process(job)
+  tests/        # unit, integration (testcontainers), chaos
+  bench/        # load scripts + RESULTS.md
+  docs/DESIGN.md  # decisions + tradeoffs + what's deferred
+```
+
+## 10. Interview defense: questions you must answer from your own build
+- Why Postgres as the queue and not Kafka/Redis/Celery? (transactional enqueue, scale ceiling, when you would switch)
+- What happens if the worker dies after posting the comment but before commit?
+- Why at-least-once plus idempotency instead of exactly-once?
+- How does a noisy repo not starve others? Show the test.
+- What breaks first at 10x load, and what would you change? (answer from your measured results)
+Write these in `docs/DESIGN.md` as "Known limits".
+
+## 11. Resume line (fill only with measured values)
+"Janus - FastAPI/Postgres CI-triage service: transactional job queue with leases, idempotent webhook ingest, retries with DLQ, per-repo fairness and rate limits; [X] webhooks/s sustained, 0 lost or duplicated jobs across worker kills (load-tested, [N] workers)."
+
+## 12. Build order for the agents
+D1 -> D2 -> D3 first, with tests, before touching the triage brain. Then D4, D5, D6. Stop after D6; deeper distribution goes in the README "what's next" (multi-region, partitioned queues, outbox to Kafka).
