@@ -1,0 +1,42 @@
+# Janus application configuration.
+#
+# Read by janus.app.config.Settings. Precedence (highest first): constructor args,
+# environment variables, .env, this file.
+#
+# Environment variables use the JANUS_ prefix; nested keys use a double underscore,
+# e.g. JANUS_SANDBOX__IMAGE=janus/python:3.12 overrides sandbox.image below.
+# Point JANUS_CONFIG_FILE at another path to use a different file. Settings can also
+# live under [tool.janus] in pyproject.toml (used when this file is absent).
+
+[sandbox]
+# Master switch for running work inside a container.
+enabled = true
+# Janus-owned base image with pytest/coverage/mutmut preinstalled.
+image = "janus/python:3.12"
+# Pull the image if it is not present locally. Set false for locally built images.
+pull_image = true
+
+# Source is copied here with `docker cp`; the container runs as this user.
+workdir = "/work"
+user = "1000:1000"
+
+# Wall-clock cap for one command; the container is killed when it is exceeded.
+timeout_seconds = 900.0
+
+# Resource limits.
+memory_mb = 2048
+cpus = 2.0
+pids_limit = 256
+# Upper bound on captured stdout/stderr per command (bytes), to bound memory and redaction.
+max_output_bytes = 1048576
+
+# Network policy. false = no network at all AND the setup phase is skipped, so only the
+# offline test phase runs. true = the setup phase runs with unrestricted network access.
+# allow_hosts is not enforceable yet (the egress proxy is not built), so setting it while
+# network = true is rejected rather than silently ignored.
+network = false
+allow_hosts = []
+
+# Phase A (setup, network on) and phase B (test, always offline). Empty = phase skipped.
+setup_command = []
+test_command = []

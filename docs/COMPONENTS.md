@@ -5,8 +5,8 @@ another. For the first-principles framing see [`ARCHITECTURE.md`](ARCHITECTURE.m
 the reasoning behind individual choices see [`DECISIONS.md`](DECISIONS.md). This document
 is the "working manual": it explains behaviour, not just structure.
 
-Scope: **S0 (spine) + Phase 2 (orchestration)**. Everything under `janus/core/`,
-`janus/sandbox/`, `janus/adapters/` and the fix surfaces is still a stub.
+Scope: **S0 (spine) + Phase 2 (orchestration) + the Phase 3 sandbox core**. Everything under
+`janus/core/`, `janus/adapters/` and the fix surfaces is still a stub.
 
 ---
 
@@ -259,7 +259,64 @@ surfaces.
 
 ---
 
-## 7. Cross-cutting behaviours
+## 7. `janus/sandbox` — the container
+
+Runs one command in an ephemeral, locked-down container and returns facts about it. The
+runner knows nothing about pytest: the adapter decides the command, the sandbox just runs
+it. Configuration comes from `janus.toml` (see `DECISIONS.md` D-046).
+
+### `settings.py` — `SandboxSettings`
+Image, work dir, run user, wall-clock timeout, resource limits, network policy, output cap,
+and the setup/test commands. Validators reject blank names, a relative `workdir`,
+non-positive limits, and `network = true` combined with a non-empty `allow_hosts` (host
+restrictions cannot be enforced yet, so the config fails closed). A bad config fails at
+startup rather than mid-run.
+
+### `spec.py` — `SandboxSpec` / `SandboxResult`
+`SandboxSpec` is a frozen description of one run (image, command, limits, network, phase,
+pull policy, output cap); `build_spec` fills it from settings, defaults the network to the
+*phase's* intent (setup may use it, tests never do), and forces it off when the
+configuration forbids it. `SandboxResult` carries the exit code, stdout/stderr, duration,
+telemetry, timeout/OOM flags, and an `error` for infrastructure failures. Both are plain
+data, so they are cheap to log and test without Docker.
+
+### `allowlist.py` — `NetworkPolicy`
+No network by default. When enabled, an empty host list means "any host" (the install
+phase). `docker_network_mode()` is the single mapping from "network allowed" to a Docker
+network mode, used by both `NetworkPolicy` and `SandboxSpec`.
+
+### `redaction.py` — `redact` / `redact_bytes`
+Four checks, cheapest first: PEM blocks, known token shapes (GitHub, AWS, Slack, OpenAI,
+JWTs, `user:pass@host`), `KEY=value` lines whose key looks secret-ish (including quoted JSON
+keys), and long high-entropy strings. Filesystem paths are deliberately preserved — they are
+evidence the triage stage needs. Everything leaving the sandbox passes through it.
+Best-effort by design.
+
+### `profiles.py` — `RunPlan`
+Builds the ordered phases for a job. `clean` is a fresh, repeatable environment; `ambient`
+attempts to match the failed CI run and records `ambient_reconstructed` when it cannot.
+Phase A (setup) is included only when the configuration allows network access **and** a
+setup command exists — otherwise the plan goes straight to the offline test phase. A
+disabled sandbox yields an empty plan (`plan.disabled`), which is the caller's signal to
+skip the container.
+
+### `telemetry.py` — `StatsSampler`
+Polls an injected callable on a background thread and keeps the peak memory and cumulative
+CPU seconds. Docker's stats API returns nothing after exit, so sampling while the container
+runs is the reliable option; the injected callable keeps it Docker-free and testable.
+
+### `runner.py` — `SandboxRunner`
+`ensure_image` (honouring `spec.pull_image`) → `create` (via the pure `container_options`)
+→ `start` → stream the source in with `put_archive` from a spooled temp file, entries owned
+by the run user → `exec_run` on a worker thread → kill on timeout → truncate → redact →
+`remove`. The root keepalive creates and `chmod 0777`s the work dir, because capabilities
+are dropped and a runtime `chown` cannot work (D-054). No host bind mounts and never the
+Docker socket. Every failure mode returns a `SandboxResult` with an `error`, never raises;
+event-loop callers use `run_in_thread`.
+
+---
+
+## 8. Cross-cutting behaviours
 
 - **Idempotency.** Webhook redeliveries are deduped by the `deliveries` PK; a job is
   one-per-delivery (`jobs.delivery_id` unique). Both are database constraints, not
@@ -278,13 +335,14 @@ surfaces.
 
 ---
 
-## 8. Still stubbed / deferred
+## 9. Still stubbed / deferred
 
 The triage brain and the rest of the backend track. See [`FUTURE.md`](FUTURE.md) for the
 full ledger. In short:
 
-- **Product brain (S1):** `janus/core/**` (reproducer, signals, triage), `janus/sandbox/**`,
-  `janus/adapters/python/**`, `janus/report/comment.py`, `janus/config/janus_yml.py`.
+- **Product brain (S1):** `janus/core/**` (reproducer, signals, triage), the adapter
+  Protocol (`janus/core/adapter.py`), `janus/adapters/python/**`, `janus/report/comment.py`,
+  `janus/config/janus_yml.py`, and wiring the sandbox into `JobProcessor`.
 - **Fix loop (S2):** `janus/core/{localize,retrieve,generate,prove}`, `janus/report/pr.py`.
 - **Backend D4–D6:** fairness/rate limits/budgets (`janus/jobs/{ratelimit,budgets}.py`),
   dedup, observability (`janus/observability/`), load test (`bench/`), Redis, and

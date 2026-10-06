@@ -254,8 +254,13 @@ attempt), per-repo daily sandbox/LLM budgets → `skipped_budget` + comment.
 bound; a 429 storm causes zero lost jobs.
 
 ### Phase 3 — Sandbox runner + adapter interface
-**Build:** rootless Docker runner (ephemeral, network-isolated with allowlist,
-read-only mounts, CPU/mem/pids/time caps, **no `docker.sock` in sandbox**); clone via
+**Status:** the **sandbox core is done** — TOML-configured settings, `SandboxSpec`/
+`SandboxResult`, network policy, secret redaction, two-phase `RunPlan`, stats sampling, and
+the container runner (`janus/sandbox/*`); see `docs/specs/SANDBOX.md`. Remaining: the
+`core/adapter.py` Protocol + conformance suite, the Python adapter, and the `JobProcessor`
+wiring.
+**Build:** rootless Docker runner (ephemeral, network-isolated with allowlist, read-only
+mounts, CPU/mem/pids/time caps, **no `docker.sock` in sandbox**); clone via
 installation token with a credential helper (token never in URL); cgroup telemetry;
 secret redaction pipeline; `core/adapter.py` Protocol; Python adapter (pytest,
 coverage.py contexts, mutmut).

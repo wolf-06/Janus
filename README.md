@@ -5,8 +5,9 @@ pipeline. For code bugs it localizes the fault, writes a fix, proves it with gat
 opens a PR.
 
 > Full plan: [`PLAN.md`](PLAN.md) · Architecture & build order:
-> [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) · Milestone spec:
-> [`docs/specs/S0.md`](docs/specs/S0.md) · Component reference:
+> [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) · Milestone specs:
+> [`docs/specs/S0.md`](docs/specs/S0.md) · [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md) ·
+> [`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md) · Component reference:
 > [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · First principles:
 > [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · Design notes:
 > [`docs/DECISIONS.md`](docs/DECISIONS.md)
@@ -15,14 +16,17 @@ opens a PR.
 
 The **backend pipeline** (D1–D3 of the backend spec) is built: idempotent ingest,
 a Postgres-as-queue with leases/heartbeat/reaper, retries with full jitter, dead-letter
-with admin requeue, cost caps, quotas and a kill switch. The triage brain (reproduce,
-classify, fix, PR) is stubbed behind `JobProcessor` and tracked in
-[`docs/FUTURE.md`](docs/FUTURE.md). Backend spec: [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md).
+with admin requeue, cost caps, quotas and a kill switch. The **sandbox core** (Phase 3) is
+built too: TOML-configured, two-phase container runs with `docker cp`, resource limits,
+telemetry and secret redaction. The triage brain (reproduce, classify, fix, PR) and the
+language adapter are stubbed and tracked in [`docs/FUTURE.md`](docs/FUTURE.md). Backend
+spec: [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
+[`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md).
 
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) (Python 3.12 is pinned via `.python-version`)
-- Docker + Docker Compose (for Postgres)
+- Docker + Docker Compose (for Postgres; also required by the sandbox)
 
 ## Quickstart
 
@@ -61,6 +65,38 @@ curl -s -X POST localhost:8000/admin/jobs/<id>/requeue
 
 The processor is a no-op stub; the reproduce/triage/fix brain plugs in at S1/S2
 (see `docs/FUTURE.md`).
+
+## Sandbox configuration
+
+Sandbox behaviour is configured in [`janus.toml`](janus.toml) (or `[tool.janus]` in
+`pyproject.toml`; set `JANUS_CONFIG_FILE` to use another path). Environment variables
+override the file, with nested keys using a double underscore, e.g.
+`JANUS_SANDBOX__IMAGE=janus/python:3.12`.
+
+```toml
+[sandbox]
+image = "janus/python:3.12"   # Janus-owned base image
+timeout_seconds = 900.0       # wall-clock cap for one command
+memory_mb = 2048
+cpus = 2.0
+pids_limit = 256
+max_output_bytes = 1048576    # per-command stdout/stderr kept
+network = false               # false => no network AND the setup phase is skipped
+setup_command = []            # phase A (network on)
+test_command = []             # phase B (always offline)
+```
+
+A run is up to two phases: **setup** installs dependencies with the network on, **tests**
+always run offline. If `network` is false, setup is skipped and only the offline test phase
+runs. The container never receives the Docker socket and no host path is bind-mounted.
+Output is redacted before it leaves the sandbox, and host allowlists are rejected until the
+egress proxy exists (the config fails closed).
+
+The Docker-gated sandbox tests skip themselves when no daemon is reachable:
+
+```bash
+uv run pytest tests/integration/test_sandbox_runner.py -q
+```
 
 ## Quality
 

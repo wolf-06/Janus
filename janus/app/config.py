@@ -1,15 +1,109 @@
 """Application settings.
 
-Infrastructure configuration is read from the environment (prefix ``JANUS_``) or a
-local ``.env`` file. Per-repository behaviour (``.janus.yml``) arrives in S1/S2; this
-module only covers process-wide settings.
+Process-wide configuration is assembled from three layers, highest priority first:
+constructor arguments, environment variables (prefix ``JANUS_``), and the TOML config file
+(``janus.toml``, or ``[tool.janus]`` in ``pyproject.toml``). A local ``.env`` file is also
+read. Per-repository behaviour (``.janus.yml``) arrives in S1/S2; this module only covers
+process-wide settings.
 """
 
 from __future__ import annotations
 
+import os
+import tomllib
 from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+from janus.sandbox.settings import SandboxSettings
+
+CONFIG_FILE_ENV = "JANUS_CONFIG_FILE"
+
+
+class ConfigError(RuntimeError):
+    """Raised when a config file is present but cannot be read or parsed."""
+
+
+def _has_janus_section(path: Path) -> bool:
+    """True when ``path`` is a ``pyproject.toml`` carrying a ``[tool.janus]`` table."""
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    tool = data.get("tool")
+    return isinstance(tool, dict) and isinstance(tool.get("janus"), dict)
+
+
+def config_file_path() -> Path | None:
+    """Resolve the TOML config file.
+
+    ``JANUS_CONFIG_FILE`` wins when set; pointing it at a missing file is an error rather
+    than a silent fallback. Otherwise the working directory and each of its parents are
+    searched for ``janus.toml``, then for a ``pyproject.toml`` carrying ``[tool.janus]``.
+    Searching upward keeps the effective configuration stable when the app is launched from
+    a subdirectory. Returns ``None`` only when no config file exists at all.
+    """
+    override = os.environ.get(CONFIG_FILE_ENV)
+    if override:
+        path = Path(override)
+        if not path.is_file():
+            raise ConfigError(f"{CONFIG_FILE_ENV} points at a missing file: {path}")
+        return path
+
+    for directory in (Path.cwd(), *Path.cwd().parents):
+        janus_toml = directory / "janus.toml"
+        if janus_toml.is_file():
+            return janus_toml
+        pyproject = directory / "pyproject.toml"
+        if pyproject.is_file() and _has_janus_section(pyproject):
+            return pyproject
+    return None
+
+
+def load_toml_config() -> dict[str, Any]:
+    """Read Janus settings from the TOML config file.
+
+    ``janus.toml`` keeps settings at the top level; ``pyproject.toml`` keeps them under
+    ``[tool.janus]``. A file that exists but cannot be read or parsed raises
+    :class:`ConfigError` so a typo fails startup instead of silently reverting every
+    setting to its default. Only a genuinely absent file yields an empty mapping.
+    """
+    path = config_file_path()
+    if path is None:
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"invalid TOML in {path}: {exc}") from exc
+    if path.name == "pyproject.toml":
+        tool = data.get("tool")
+        if not isinstance(tool, dict):
+            return {}
+        janus = tool.get("janus")
+        return janus if isinstance(janus, dict) else {}
+    return data
+
+
+class TomlSettingsSource(PydanticBaseSettingsSource):
+    """A settings source backed by a mapping already parsed from TOML."""
+
+    def __init__(self, settings_cls: type[BaseSettings], data: dict[str, Any]) -> None:
+        super().__init__(settings_cls)
+        self._data = data
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._data.get(field_name), field_name, False
+
+    def __call__(self) -> dict[str, Any]:
+        return self._data
 
 
 class Settings(BaseSettings):
@@ -24,6 +118,7 @@ class Settings(BaseSettings):
         env_prefix="JANUS_",
         env_file=".env",
         env_file_encoding="utf-8",
+        env_nested_delimiter="__",
         extra="ignore",
     )
 
@@ -42,6 +137,10 @@ class Settings(BaseSettings):
     github_webhook_secret: str | None = None
     github_client_id: str | None = None
     github_client_secret: str | None = None
+
+    # --- Sandbox ---
+    # Loaded from the TOML config file; see ``janus/sandbox/settings.py``.
+    sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
 
     # --- Orchestrator guardrails ---
     # Hard stop for all workers, independent of the DB kill switch.
@@ -67,6 +166,24 @@ class Settings(BaseSettings):
     queue_depth_limit: int = 10_000
     # Phase-2 stub processor latency (seconds); replaced by the real brain in S1/S2.
     stub_processing_seconds: float = 0.0
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Layer the TOML file below the environment (so env still overrides it)."""
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            TomlSettingsSource(settings_cls, load_toml_config()),
+            file_secret_settings,
+        )
 
 
 @lru_cache

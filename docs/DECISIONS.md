@@ -680,3 +680,163 @@ preserve.
 
 **Consequences.** (+) A clean baseline; `alembic check` clean. (−) History collapses
 pre-release; acceptable with no deployments. *Reversible:* no (once deployed).
+
+### D-046 — Sandbox settings live in a TOML config file
+
+**Context.** Sandbox behaviour (image, limits, network, commands) needs tuning without code
+changes, and it is process-wide infrastructure rather than per-repository behaviour.
+
+**Decision.** Read sandbox settings from `janus.toml` (top-level tables), falling back to
+`[tool.janus]` in `pyproject.toml`, with `JANUS_CONFIG_FILE` overriding the path.
+Environment variables still win over the file; nested keys use a double underscore
+(`JANUS_SANDBOX__IMAGE`).
+
+**Alternatives.** Env vars only — awkward for nested lists like `allow_hosts`. A YAML file —
+`PLAN.md` reserves `.janus.yml` for per-repo config, so the process-wide file uses TOML.
+
+**Consequences.** (+) Limits are inspectable and diffable; one source of truth per process.
+(−) A second configuration mechanism alongside env vars, mitigated by a strict precedence
+order. *Reversible:* yes.
+
+### D-047 — Copy source in with `docker cp`, no host bind mounts
+
+**Context.** The sandbox needs the repository's code, and `PLAN.md` §4 requires read-only
+mounts and no host exposure.
+
+**Decision.** Create the container, start it, and copy the source in with `put_archive` (the
+`docker cp` API), then `chown` it to the run user. Nothing is bind-mounted from the host.
+
+**Alternatives.** Bind-mount the repo read-only — simpler, but exposes a host path and needs
+a second writable mount for caches; a named volume — allows a read-only rootfs but adds
+lifecycle and cleanup risk.
+
+**Consequences.** (+) The host filesystem is never exposed; cleanup is just container
+removal. (−) The copy is O(size) per run, and (see D-049) it precludes a read-only rootfs.
+*Reversible:* yes.
+
+### D-048 — Two-phase runs; setup may use the network, the test never does
+
+**Context.** Installing dependencies needs the internet; running untrusted test code should
+not have it.
+
+**Decision.** A run is up to two phases. Phase A (setup) runs with network access; phase B
+(the tests) always runs with `network_mode=none`. When the configuration forbids network
+access, phase A is skipped entirely and only phase B runs.
+
+**Alternatives.** One phase with network on throughout — simpler but gives untrusted tests
+network access. Always offline — breaks dependency install for most repos.
+
+**Consequences.** (+) Tests are offline while installs still work; the offline path is a
+single phase. (−) Two container lifecycles when setup is needed. *Reversible:* yes.
+
+### D-049 — Ephemeral writable rootfs instead of a read-only rootfs
+
+**Context.** `docker cp` refuses to write into a read-only rootfs unless the destination is a
+volume, and a tmpfs at the work dir is invisible to `put_archive` (the daemon writes to the
+rootfs path, which the tmpfs shadows). Both were confirmed by the integration test.
+
+**Decision.** Leave the rootfs writable and rely on the container's own ephemeral layer,
+which is discarded on removal. Keep a size-limited `tmpfs` at `/tmp`. Isolation comes from
+no host bind mounts, no network, dropped capabilities, `no-new-privileges`, a non-root user,
+and resource limits.
+
+**Alternatives.** Read-only rootfs plus a named volume for the work dir — stronger, but adds
+volume lifecycle and cleanup risk; tmpfs work dir — incompatible with `put_archive`.
+
+**Consequences.** (+) Copying works and cleanup stays trivial. (−) Writes are bounded by the
+container layer rather than by a tmpfs quota; revisit if a read-only rootfs is required.
+*Reversible:* yes.
+
+### D-050 — Resource telemetry by sampling the stats API
+
+**Context.** Docker's stats API is a stream and returns nothing once a container exits, so a
+post-mortem read is unreliable.
+
+**Decision.** A `StatsSampler` background thread polls the stats API every 0.5 s and keeps
+the peak memory and cumulative CPU seconds. It takes an injected callable, so it is testable
+without Docker.
+
+**Alternatives.** Read cgroup files from the host — more precise, but path- and
+version-dependent; rely on the exit code — no resource data at all.
+
+**Consequences.** (+) Portable, no host paths, unit-testable. (−) Sampling can miss very
+short-lived peaks (the interval bounds resolution). *Reversible:* yes.
+
+### D-051 — A Janus-owned base image
+
+**Context.** Runs must be repeatable and reasonably fast.
+
+**Decision.** Default to a Janus-owned image (`janus/python:3.12`) with pytest, coverage.py
+and mutmut preinstalled, configurable in the TOML file.
+
+**Alternatives.** Pull `python:3.12-slim` and install per run — slower and less repeatable.
+
+**Consequences.** (+) Faster, reproducible runs. (−) The image must be built and published;
+`pull_image = false` supports locally built images. *Reversible:* yes.
+
+### D-052 — Fail closed on an unenforceable host allowlist
+
+**Context.** The egress allowlist proxy is not built, but `allow_hosts` exists in the config
+and reads as an enforced restriction. `network = true` produces an unrestricted bridge.
+
+**Decision.** Reject `network = true` combined with a non-empty `allow_hosts` at settings
+validation. Callers must either clear the host list (accepting unrestricted egress) or keep
+the network off.
+
+**Alternatives.** Silently ignore the host list — leaves a false sense of restriction.
+Build the proxy now — out of scope for this phase.
+
+**Consequences.** (+) The configuration cannot overstate its isolation; the limitation is
+explicit. (−) Expressing a host list is deferred until enforcement exists. *Reversible:* yes
+(when the proxy lands, the validator is relaxed).
+
+### D-053 — Config discovery searches upward and fails loudly
+
+**Context.** Config discovery was relative to the process working directory, so launching
+from a subdirectory silently loaded defaults; and a malformed file was swallowed, silently
+reverting every setting.
+
+**Decision.** Search the working directory and its parents for `janus.toml`, then for a
+`pyproject.toml` carrying `[tool.janus]`. An explicit `JANUS_CONFIG_FILE` must exist. A
+found file that cannot be read or parsed raises `ConfigError` at startup.
+
+**Alternatives.** Keep cwd-only discovery — silently environment-dependent. Ignore bad
+files — hides typos.
+
+**Consequences.** (+) The same checkout behaves the same from any subdirectory; a typo is a
+startup error rather than a silent default. (−) Discovery does a little I/O up the tree.
+*Reversible:* yes.
+
+### D-054 — Work-dir permissions without capabilities
+
+**Context.** The container drops all capabilities, so root inside it cannot `chown`
+(capability-less root is subject to normal DAC). The earlier `chown -R` always failed with
+`EPERM`, and `/work` is created `root:root 755`, so the run user could not write caches.
+
+**Decision.** Make the work dir writable from the root keepalive (`chmod 0777`, which the
+owner can do without capabilities) and write the copied tar entries with the run user's
+uid/gid via the archive filter. Drop the runtime `chown` entirely.
+
+**Alternatives.** Keep `CAP_CHOWN` — weakens the isolation for one operation. Run as root —
+defeats the non-root user.
+
+**Consequences.** (+) The run user can read and write the work dir; the tar path stays
+capability-free. (−) `chmod 0777` makes the work dir writable by any container user, which
+is acceptable in a single-tenant ephemeral container. *Reversible:* yes.
+
+### D-055 — Bounded output, streamed source archive, async entry point
+
+**Context.** Review found three resource hazards: the whole repo was tarred twice in memory,
+command output was unbounded, and the sync `run()` would block the async worker loop.
+
+**Decision.** Build the source archive into a spooled temp file (rolling to disk past 8 MiB)
+and stream it to `put_archive`; truncate captured output to `max_output_bytes` before
+redaction; add `SandboxRunner.run_in_thread` (`asyncio.to_thread`) as the entry point for
+event-loop callers.
+
+**Alternatives.** Keep in-memory tar — OOM risk on large checkouts. Bound capture inside the
+container — needs output streaming, deferred.
+
+**Consequences.** (+) Worker memory and redaction time are bounded; the loop stays
+responsive when wired. (−) Output is still buffered by `exec_run` before truncation.
+*Reversible:* yes.

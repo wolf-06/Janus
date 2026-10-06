@@ -62,10 +62,14 @@ brain (S1/S2) plugs into the worker without changing the pipeline.
 
 ## B. Product brain (S1) — reproduce + triage
 
-- **Sandbox runner + adapter interface (Phase 3):** rootless Docker, no `docker.sock`,
-  network allowlist, read-only mounts, CPU/mem/time caps, cgroup telemetry, secret
-  redaction, `core/adapter.py` Protocol, Python adapter (pytest, coverage.py contexts,
-  mutmut).
+- **Sandbox runner (Phase 3):** *done* — `janus/sandbox/{settings,spec,allowlist,redaction,`
+  `profiles,telemetry,runner}.py` with TOML-configured limits, two-phase runs, `docker cp`,
+  resource sampling, and secret redaction. Remaining for Phase 3: rootless-Docker support
+  (currently plain Docker; see `docs/specs/SANDBOX.md` §7), the network allowlist *proxy*
+  (the policy exists, enforcement does not), and the Janus base image build.
+- **Adapter interface (Phase 3):** `core/adapter.py` Protocol, the adapter conformance
+  suite, and the Python adapter (pytest, coverage.py contexts, mutmut); then wire the
+  sandbox into `JobProcessor`.
 - **Reproducer (Phase 4):** K=5 reruns of failing targets + one full-suite run; `clean`
   and `ambient` profiles.
 - **7 signal collectors + scorer:** determinism, signatures, exit codes, resources, change
