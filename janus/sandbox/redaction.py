@@ -3,15 +3,22 @@
 Logs and command output can contain credentials. Everything that leaves the sandbox —
 stored rows, LLM prompts, comments — must pass through :func:`redact` first.
 
-Four independent checks run in order, cheapest and most certain first:
+Independent checks run in order, cheapest and most certain first:
 
 1. PEM blocks (private keys).
-2. Known token shapes (GitHub, AWS, Slack, OpenAI, JWTs, ``user:pass@host``).
-3. ``KEY=value`` lines whose key name looks secret-ish (including quoted JSON keys).
-4. Long high-entropy strings, which are almost always secrets.
+2. Known token shapes (GitHub, AWS, Slack, Stripe, Google, npm, HuggingFace, Docker,
+   PyPI, SSH key material, JWTs, ``user:pass@host``).
+3. ``Authorization: Bearer`` / ``Authorization: Basic`` credentials — the scheme word is
+   kept, only the credential is redacted.
+4. ``KEY=value`` lines whose key name looks secret-ish (including quoted JSON keys).
+5. Long high-entropy strings, which are almost always secrets.
+6. High-entropy path *segments* — a machine-generated segment inside a path is redacted
+   while the path itself (and its ``/`` separators) survives.
 
 Filesystem paths are deliberately left intact: they are ubiquitous in tracebacks and
-coverage output, and the triage stage depends on them.
+coverage output, and the triage stage depends on them. Pass 6 narrows that promise to the
+path *structure*: the separators and ordinary segments survive, but a single long
+random-looking segment is treated as a secret and replaced.
 
 Redaction is best-effort: it reduces leakage, it does not guarantee it.
 """
@@ -28,14 +35,28 @@ _PEM_RE = re.compile(r"-----BEGIN [A-Z ]+-----.*?-----END [A-Z ]+-----", re.DOTA
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bxapp-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
+    re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"\bdckr_pat_[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{10,}\b"),
+    re.compile(r"\bssh-(?:rsa|ed25519) [A-Za-z0-9+/=]{20,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\b[A-Za-z0-9._%+-]+:[^\s/@]+@[A-Za-z0-9.-]+\b"),
 )
 
 _BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{16,}")
+
+# ``Authorization: Basic`` carries base64 ``user:password``; keep the scheme word, redact
+# only the credential. Base64 uses ``+``, ``/`` and ``=`` padding.
+_BASIC_RE = re.compile(r"(?i)\b(basic\s+)[A-Za-z0-9+/=]{8,}")
 
 _SECRET_KEY_RE = re.compile(
     r"(?i)\b("
@@ -49,6 +70,10 @@ _SECRET_KEY_RE = re.compile(
 )
 
 _ENTROPY_RE = re.compile(r"[A-Za-z0-9+/=_\-]{24,}")
+
+# Path-shaped runs. Only characters that can legitimately appear in a filesystem path are
+# consumed, so trailing prose punctuation (quotes, commas, brackets) is not swallowed.
+_PATH_RE = re.compile(r"[A-Za-z0-9._~@%+=:/-]+")
 
 _MIN_ENTROPY_LENGTH = 24
 _ENTROPY_THRESHOLD = 3.7
@@ -99,6 +124,18 @@ def _redact_if_random(match: re.Match[str]) -> str:
     return REDACTED if _looks_random(token) else token
 
 
+def _redact_path_segments(match: re.Match[str]) -> str:
+    """Redact only the random-looking segments of a path, preserving its structure.
+
+    The separators and ordinary segments are evidence and survive; a single long
+    high-entropy segment (e.g. a signed URL component) is replaced in place.
+    """
+    token = match.group(0)
+    if "/" not in token:
+        return token
+    return "/".join(REDACTED if _looks_random(segment) else segment for segment in token.split("/"))
+
+
 def redact(text: str) -> str:
     """Return ``text`` with secrets replaced by ``[REDACTED]``."""
     if not text:
@@ -107,8 +144,10 @@ def redact(text: str) -> str:
     for pattern in _TOKEN_PATTERNS:
         result = pattern.sub(REDACTED, result)
     result = _BEARER_RE.sub(lambda m: f"{m.group(1)}{REDACTED}", result)
+    result = _BASIC_RE.sub(lambda m: f"{m.group(1)}{REDACTED}", result)
     result = _SECRET_KEY_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", result)
-    return _ENTROPY_RE.sub(_redact_if_random, result)
+    result = _ENTROPY_RE.sub(_redact_if_random, result)
+    return _PATH_RE.sub(_redact_path_segments, result)
 
 
 def redact_bytes(data: bytes) -> str:
