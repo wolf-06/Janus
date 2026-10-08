@@ -8,14 +8,15 @@ import pytest
 from pydantic import ValidationError
 
 from janus.app.config import ConfigError, Settings, config_file_path, load_toml_config
-from janus.sandbox.settings import SandboxSettings
+from janus.sandbox.settings import ImageSource, SandboxSettings
 
 
 def test_shipped_janus_toml_is_loaded() -> None:
     """The repository's janus.toml is picked up when running from the project root."""
     assert Path("janus.toml").is_file()
     settings = Settings(_env_file=None)
-    assert settings.sandbox.image == "janus/python:3.12"
+    assert settings.sandbox.image == "python:3.12-slim"
+    assert settings.sandbox.image_source == ImageSource.AUTO
     assert settings.sandbox.network is False
     assert settings.sandbox.timeout_seconds == 900.0
 
@@ -130,9 +131,11 @@ def test_allow_hosts_are_normalised() -> None:
     assert settings.allow_hosts == ["pypi.org", "github.com"]
 
 
-def test_network_with_allow_hosts_is_rejected() -> None:
-    with pytest.raises(ValidationError):
-        SandboxSettings(network=True, allow_hosts=["pypi.org"])
+def test_network_with_allow_hosts_is_accepted() -> None:
+    """A host list is now enforced by the egress proxy, so it is valid config."""
+    settings = SandboxSettings(network=True, allow_hosts=["pypi.org"])
+    assert settings.network is True
+    assert settings.allow_hosts == ["pypi.org"]
 
 
 def test_max_output_bytes_must_be_positive() -> None:

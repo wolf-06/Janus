@@ -4,11 +4,26 @@ from __future__ import annotations
 
 import io
 import tarfile
+import threading
+import types
 from pathlib import Path
 
-from janus.sandbox.runner import SandboxRunner, _truncate, container_options, tar_directory
-from janus.sandbox.settings import SandboxSettings
-from janus.sandbox.spec import SandboxResult, SandboxSpec, build_spec
+import pytest
+from docker.errors import DockerException
+
+from janus.sandbox.image import ImageBuildError, ResolvedImage
+from janus.sandbox.proxy import ProxyError
+from janus.sandbox.runner import (
+    _TRUNCATED_SUFFIX,
+    SandboxRunner,
+    _truncate,
+    container_options,
+    is_rootless,
+    tar_directory,
+)
+from janus.sandbox.settings import ImageSource, SandboxSettings
+from janus.sandbox.spec import SandboxPhase, SandboxResult, SandboxSpec, build_spec
+from janus.sandbox.telemetry import ResourceSample
 
 
 def _names(payload: bytes) -> list[str]:
@@ -83,6 +98,22 @@ def test_container_options_pass_the_workdir_to_the_keepalive() -> None:
     assert options["working_dir"] == "/workspace"
 
 
+def test_container_options_accept_network_and_environment_overrides() -> None:
+    spec = build_spec(SandboxSettings(), command=["pytest"])
+    env = {"HTTP_PROXY": "http://proxy:8888"}
+
+    options = container_options(spec, network_mode="janus-sbx-abc", environment=env)
+
+    assert options["network_mode"] == "janus-sbx-abc"
+    assert options["environment"] == env
+
+
+def test_container_options_omit_environment_by_default() -> None:
+    options = container_options(build_spec(SandboxSettings(), command=["pytest"]))
+    assert "environment" not in options
+    assert options["network_mode"] == "none"
+
+
 def test_tar_directory_sets_owner(tmp_path: Path) -> None:
     (tmp_path / "a.txt").write_text("a")
     payload = tar_directory(tmp_path, owner=(1000, 1001))
@@ -112,3 +143,541 @@ async def test_run_in_thread_returns_the_result() -> None:
     result = await _StubRunner().run_in_thread(build_spec(SandboxSettings(), command=["pytest"]))
 
     assert result.ok is True
+
+
+class _StubExecResult:
+    def __init__(self, exit_code: int, output: bytes) -> None:
+        self.exit_code = exit_code
+        self.output = output
+
+
+class _FakeApi:
+    """Minimal stand-in for the low-level ``client.api`` exec endpoints.
+
+    ``exec_start`` returns a generator of ``(stdout, stderr)`` chunks and records how many it
+    handed out, so a test can prove the runner drained the whole stream.
+    """
+
+    def __init__(
+        self,
+        chunks: list[tuple[bytes | None, bytes | None]] | None = None,
+        *,
+        exit_code: int | None = 0,
+    ) -> None:
+        self.chunks = list(chunks) if chunks is not None else [(b"out", b"err")]
+        self.exit_code = exit_code
+        self.consumed = 0
+        self.created: list[list[str]] = []
+
+    def exec_create(self, container: str, cmd: list[str], **kwargs: object) -> dict[str, str]:
+        self.created.append(list(cmd))
+        return {"Id": "exec-1"}
+
+    def exec_start(self, exec_id: str, **kwargs: object) -> object:
+        def _gen() -> object:
+            for chunk in self.chunks:
+                self.consumed += 1
+                yield chunk
+
+        return _gen()
+
+    def exec_inspect(self, exec_id: str) -> dict[str, object]:
+        return {"ExitCode": self.exit_code}
+
+
+class _StubContainer:
+    def __init__(
+        self,
+        exit_code: int,
+        chunks: list[tuple[bytes | None, bytes | None]] | None = None,
+    ) -> None:
+        self._exit_code = exit_code
+        self.attrs: dict[str, object] = {"State": {"OOMKilled": False}}
+        self.removed = False
+        self.id = "container-1"
+        self.api = _FakeApi(chunks, exit_code=exit_code)
+        self.client = types.SimpleNamespace(api=self.api)
+
+    def start(self) -> None:
+        return None
+
+    def exec_run(self, command: list[str], **kwargs: object) -> object:
+        # Only the work-dir preparation still goes through exec_run.
+        return _StubExecResult(0, b"")
+
+    def stats(self, stream: bool = False) -> dict[str, object]:
+        return {"cpu_stats": {"cpu_usage": {"total_usage": 0}}, "memory_stats": {}}
+
+    def put_archive(self, path: str, archive: object) -> bool:
+        return True
+
+    def kill(self) -> None:
+        return None
+
+    def remove(self, force: bool = False) -> bool:
+        self.removed = True
+        return True
+
+
+class _StubContainers:
+    def __init__(self, container: _StubContainer) -> None:
+        self._container = container
+        self.created_kwargs: list[dict[str, object]] = []
+
+    def create(self, image: str, **kwargs: object) -> _StubContainer:
+        self.created_kwargs.append(kwargs)
+        return self._container
+
+
+class _StubImages:
+    def get(self, image: str) -> object:
+        return object()
+
+    def pull(self, image: str) -> object:
+        return object()
+
+    def remove(self, image: str, force: bool = False) -> bool:
+        return True
+
+
+class _StubClient:
+    def __init__(
+        self,
+        *,
+        exit_code: int = 0,
+        security_options: list[str] | None = None,
+    ) -> None:
+        self.container = _StubContainer(exit_code)
+        self.containers = _StubContainers(self.container)
+        self.images = _StubImages()
+        self._security_options = security_options if security_options is not None else []
+
+    def info(self) -> dict[str, object]:
+        return {"SecurityOptions": self._security_options}
+
+
+def _patch_image(
+    monkeypatch: pytest.MonkeyPatch, *, build: bool, tag: str = "janus-sandbox:testtag"
+) -> tuple[list[str], list[str]]:
+    built: list[str] = []
+    removed: list[str] = []
+
+    def _resolve(settings: SandboxSettings, source_dir: Path | None) -> ResolvedImage:
+        return ResolvedImage(tag=tag, build=build, dockerfile="FROM x\n", context=None)
+
+    def _build(client: object, resolved: ResolvedImage, settings: SandboxSettings) -> None:
+        built.append(resolved.tag)
+
+    def _remove(client: object, tag_: str) -> None:
+        removed.append(tag_)
+
+    monkeypatch.setattr("janus.sandbox.runner.resolve_image", _resolve)
+    monkeypatch.setattr("janus.sandbox.runner.build_image", _build)
+    monkeypatch.setattr("janus.sandbox.runner.remove_image", _remove)
+    return built, removed
+
+
+def test_a_built_image_is_removed_after_a_successful_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(image_source=ImageSource.GENERATED)
+    runner = SandboxRunner(client=client, settings=settings)
+    built, removed = _patch_image(monkeypatch, build=True, tag="janus-sandbox:abc")
+
+    result = runner.run(build_spec(settings, command=["pytest"]))
+
+    assert result.ok is True
+    assert result.image == "janus-sandbox:abc"
+    assert built == ["janus-sandbox:abc"]
+    assert removed == ["janus-sandbox:abc"]
+
+
+def test_a_built_image_is_removed_after_a_failing_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient(exit_code=1)
+    settings = SandboxSettings(image_source=ImageSource.GENERATED)
+    runner = SandboxRunner(client=client, settings=settings)
+    built, removed = _patch_image(monkeypatch, build=True, tag="janus-sandbox:def")
+
+    result = runner.run(build_spec(settings, command=["pytest"]))
+
+    assert result.ok is False
+    assert built == ["janus-sandbox:def"]
+    assert removed == ["janus-sandbox:def"]
+
+
+def test_a_built_image_is_kept_when_remove_image_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(image_source=ImageSource.GENERATED, remove_image=False)
+    runner = SandboxRunner(client=client, settings=settings)
+    built, removed = _patch_image(monkeypatch, build=True, tag="janus-sandbox:keep")
+
+    runner.run(build_spec(settings, command=["pytest"]))
+
+    assert built == ["janus-sandbox:keep"]
+    assert removed == []
+
+
+def test_a_prebuilt_image_is_never_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(image_source=ImageSource.PREBUILT, image="python:3.12-slim")
+    runner = SandboxRunner(client=client, settings=settings)
+    built, removed = _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+
+    result = runner.run(build_spec(settings, command=["pytest"]))
+
+    assert result.ok is True
+    assert built == []
+    assert removed == []
+
+
+def test_a_build_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(image_source=ImageSource.GENERATED)
+    runner = SandboxRunner(client=client, settings=settings)
+    monkeypatch.setattr(
+        "janus.sandbox.runner.resolve_image",
+        lambda settings, source_dir: ResolvedImage(tag="t", build=True, context=None),
+    )
+
+    def _boom(client: object, resolved: ResolvedImage, settings: SandboxSettings) -> None:
+        raise ImageBuildError("boom")
+
+    monkeypatch.setattr("janus.sandbox.runner.build_image", _boom)
+
+    result = runner.run(build_spec(settings, command=["pytest"]))
+
+    assert result.error is not None
+    assert result.error.startswith("image_build_failed:")
+    assert client.container.removed is False
+
+
+def test_exec_bounds_streamed_output_and_drains_the_whole_stream() -> None:
+    limit = 16
+    chunks: list[tuple[bytes | None, bytes | None]] = [(b"a" * 20, b"b" * 20)] * 5
+    container = _StubContainer(exit_code=0, chunks=chunks)
+    settings = SandboxSettings(max_output_bytes=limit)
+    runner = SandboxRunner(settings=settings)
+    spec = build_spec(settings, command=["pytest"])
+
+    exit_code, stdout, stderr, timed_out, error = runner._exec(container, spec)
+
+    assert exit_code == 0
+    assert timed_out is False
+    assert error is None
+    assert stdout.startswith(b"a" * limit)
+    assert len(stdout) == limit + len(_TRUNCATED_SUFFIX)
+    assert _TRUNCATED_SUFFIX in stdout
+    assert stderr.startswith(b"b" * limit)
+    assert len(stderr) == limit + len(_TRUNCATED_SUFFIX)
+    assert _TRUNCATED_SUFFIX in stderr
+    # Every chunk was pulled, so a chatty command cannot block on a full pipe.
+    assert container.api.consumed == len(chunks)
+
+
+class _HangingApi:
+    """An exec whose stream blocks until the container is killed."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.started = False
+        self.exit_code = 0
+
+    def exec_create(self, container: str, cmd: list[str], **kwargs: object) -> dict[str, str]:
+        return {"Id": "exec-1"}
+
+    def exec_start(self, exec_id: str, **kwargs: object) -> object:
+        def _gen() -> object:
+            self.started = True
+            self.release.wait(30)
+            return
+            yield  # pragma: no cover - unreachable; marks this a generator
+
+        return _gen()
+
+    def exec_inspect(self, exec_id: str) -> dict[str, object]:
+        return {"ExitCode": self.exit_code}
+
+
+class _HangingContainer:
+    def __init__(self, api: _HangingApi) -> None:
+        self.api = api
+        self.client = types.SimpleNamespace(api=api)
+        self.id = "container-1"
+        self.attrs: dict[str, object] = {"State": {"OOMKilled": False}}
+        self.killed = False
+
+    def kill(self) -> None:
+        self.killed = True
+        self.api.release.set()
+
+
+def test_exec_times_out_and_kills_a_command_that_never_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("janus.sandbox.runner._EXEC_KILL_GRACE_SECONDS", 0.5)
+    container = _HangingContainer(_HangingApi())
+    settings = SandboxSettings(timeout_seconds=0.05)
+    runner = SandboxRunner(settings=settings)
+    spec = build_spec(settings, command=["sleep", "60"])
+
+    exit_code, _stdout, _stderr, timed_out, error = runner._exec(container, spec)
+
+    assert timed_out is True
+    assert exit_code is None
+    assert error is None
+    assert container.killed is True
+
+
+def _capture_sample_interval(
+    monkeypatch: pytest.MonkeyPatch, runner: SandboxRunner, spec: SandboxSpec
+) -> float:
+    captured: dict[str, float] = {}
+
+    class _FakeSampler:
+        def __init__(self, sample: object, *, interval: float) -> None:
+            captured["interval"] = interval
+
+        def start(self) -> _FakeSampler:
+            return self
+
+        def stop(self) -> ResourceSample:
+            return ResourceSample()
+
+    monkeypatch.setattr("janus.sandbox.runner.StatsSampler", _FakeSampler)
+    runner.run(spec)
+    return captured["interval"]
+
+
+def test_runner_passes_the_configured_sample_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(
+        image_source=ImageSource.PREBUILT, telemetry_sample_interval_seconds=0.75
+    )
+    runner = SandboxRunner(client=client, settings=settings)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+
+    interval = _capture_sample_interval(
+        monkeypatch, runner, build_spec(settings, command=["pytest"])
+    )
+
+    assert interval == 0.75
+
+
+def test_explicit_sample_interval_wins_over_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(
+        image_source=ImageSource.PREBUILT, telemetry_sample_interval_seconds=0.75
+    )
+    runner = SandboxRunner(client=client, settings=settings, sample_interval=0.01)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+
+    interval = _capture_sample_interval(
+        monkeypatch, runner, build_spec(settings, command=["pytest"])
+    )
+
+    assert interval == 0.01
+
+
+def test_is_rootless_true_when_the_daemon_reports_it() -> None:
+    class _Client:
+        def info(self) -> dict[str, object]:
+            return {"SecurityOptions": ["name=seccomp", "name=rootless"]}
+
+    assert is_rootless(_Client()) is True  # type: ignore[arg-type]
+
+
+def test_is_rootless_false_for_a_rootful_daemon() -> None:
+    class _Client:
+        def info(self) -> dict[str, object]:
+            return {"SecurityOptions": ["name=seccomp,profile=builtin"]}
+
+    assert is_rootless(_Client()) is False  # type: ignore[arg-type]
+
+
+def test_is_rootless_is_defensive() -> None:
+    class _NoOptions:
+        def info(self) -> dict[str, object]:
+            return {}
+
+    class _NoneOptions:
+        def info(self) -> dict[str, object]:
+            return {"SecurityOptions": None}
+
+    class _BadOptions:
+        def info(self) -> dict[str, object]:
+            return {"SecurityOptions": 5}
+
+    class _NoInfo:
+        def info(self) -> dict[str, object]:
+            raise DockerException("no daemon")
+
+    assert is_rootless(_NoOptions()) is False  # type: ignore[arg-type]
+    assert is_rootless(_NoneOptions()) is False  # type: ignore[arg-type]
+    assert is_rootless(_BadOptions()) is False  # type: ignore[arg-type]
+    assert is_rootless(_NoInfo()) is False  # type: ignore[arg-type]
+
+
+def test_run_returns_not_rootless_when_required_but_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient(exit_code=0, security_options=["name=seccomp"])
+    settings = SandboxSettings(require_rootless=True)
+    runner = SandboxRunner(client=client, settings=settings)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+
+    result = runner.run(build_spec(settings, command=["pytest"]))
+
+    assert result.error == "not_rootless"
+    assert result.exit_code is None
+
+
+def test_run_proceeds_when_rootless_is_required_and_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient(exit_code=0, security_options=["name=rootless"])
+    settings = SandboxSettings(require_rootless=True)
+    runner = SandboxRunner(client=client, settings=settings)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+
+    result = runner.run(build_spec(settings, command=["pytest"]))
+
+    assert result.error is None
+    assert result.ok is True
+
+
+def test_docker_uses_base_url_when_docker_host_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+
+    def _client(base_url: str | None = None) -> object:
+        calls["base_url"] = base_url
+        return object()
+
+    def _from_env(*args: object, **kwargs: object) -> object:
+        calls["from_env"] = True
+        return object()
+
+    monkeypatch.setattr("janus.sandbox.runner.docker.DockerClient", _client)
+    monkeypatch.setattr("janus.sandbox.runner.docker.from_env", _from_env)
+    runner = SandboxRunner(
+        settings=SandboxSettings(docker_host="unix:///run/user/1000/docker.sock")
+    )
+
+    runner._docker()
+
+    assert calls["base_url"] == "unix:///run/user/1000/docker.sock"
+    assert "from_env" not in calls
+
+
+def test_docker_falls_back_to_from_env_without_a_docker_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    def _client(base_url: str | None = None) -> object:
+        calls["base_url"] = base_url
+        return object()
+
+    def _from_env(*args: object, **kwargs: object) -> object:
+        calls["from_env"] = True
+        return object()
+
+    monkeypatch.setattr("janus.sandbox.runner.docker.DockerClient", _client)
+    monkeypatch.setattr("janus.sandbox.runner.docker.from_env", _from_env)
+    runner = SandboxRunner(settings=SandboxSettings())
+
+    runner._docker()
+
+    assert calls.get("from_env") is True
+    assert "base_url" not in calls
+
+
+class _FakeProxySession:
+    """Records enter/exit and exposes the network + env the runner must pass on."""
+
+    instances: list[_FakeProxySession] = []
+
+    def __init__(
+        self,
+        client: object,
+        settings: SandboxSettings,
+        *,
+        allow_hosts: tuple[str, ...],
+        run_id: str | None = None,
+    ) -> None:
+        self.allow_hosts = tuple(allow_hosts)
+        self.internal_network = "janus-sbx-fake"
+        self.upstream_network = "janus-sbx-up-fake"
+        self.proxy_host = "janus-sbx-proxy-fake"
+        self.entered = False
+        self.exited = False
+        _FakeProxySession.instances.append(self)
+
+    def __enter__(self) -> _FakeProxySession:
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        self.exited = True
+        return False
+
+    def env(self) -> dict[str, str]:
+        url = "http://janus-sbx-proxy-fake:8888"
+        return {"HTTP_PROXY": url, "HTTPS_PROXY": url, "http_proxy": url, "https_proxy": url}
+
+
+def _enforced_spec() -> SandboxSpec:
+    settings = SandboxSettings(network=True, allow_hosts=["pypi.org"])
+    return build_spec(settings, command=["pytest"], phase=SandboxPhase.SETUP, network=True)
+
+
+def test_run_with_enforcement_opens_and_closes_a_proxy_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(network=True, allow_hosts=["pypi.org"])
+    runner = SandboxRunner(client=client, settings=settings)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+    _FakeProxySession.instances = []
+    monkeypatch.setattr("janus.sandbox.runner.ProxySession", _FakeProxySession)
+
+    result = runner.run(_enforced_spec())
+
+    assert result.ok is True
+    assert len(_FakeProxySession.instances) == 1
+    session = _FakeProxySession.instances[0]
+    assert session.entered is True
+    assert session.exited is True
+    assert session.allow_hosts == ("pypi.org",)
+    kwargs = client.containers.created_kwargs[0]
+    assert kwargs["network_mode"] == session.internal_network
+    assert kwargs["environment"] == session.env()
+
+
+class _FailingProxySession:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+    def __enter__(self) -> object:
+        raise ProxyError("boom")
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def test_proxy_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(network=True, allow_hosts=["pypi.org"])
+    runner = SandboxRunner(client=client, settings=settings)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+    monkeypatch.setattr("janus.sandbox.runner.ProxySession", _FailingProxySession)
+
+    result = runner.run(_enforced_spec())
+
+    assert result.error is not None
+    assert result.error.startswith("proxy_failed:")
+    assert client.container.removed is False

@@ -4,17 +4,48 @@
 # environment variables, .env, this file.
 #
 # Environment variables use the JANUS_ prefix; nested keys use a double underscore,
-# e.g. JANUS_SANDBOX__IMAGE=janus/python:3.12 overrides sandbox.image below.
-# Point JANUS_CONFIG_FILE at another path to use a different file. Settings can also
+# e.g. JANUS_SANDBOX__IMAGE=python:3.12-slim overrides sandbox.image below. Point
+# JANUS_CONFIG_FILE at another path to use a different file. Settings can also
 # live under [tool.janus] in pyproject.toml (used when this file is absent).
 
 [sandbox]
 # Master switch for running work inside a container.
 enabled = true
-# Janus-owned base image with pytest/coverage/mutmut preinstalled.
-image = "janus/python:3.12"
-# Pull the image if it is not present locally. Set false for locally built images.
+
+# Image strategy. "auto" uses a Dockerfile at the repository root when one exists,
+# otherwise a Janus-generated one; "repo" requires a repo Dockerfile; "generated" always
+# generates one; "prebuilt" uses `image` as-is and pulls it. There is no published Janus
+# base image: every built image is used for one run and removed afterwards (ADR D-056).
+image_source = "auto"
+# The "prebuilt" image, and the base for a generated Dockerfile when `base_image` is unset.
+image = "python:3.12-slim"
+# Override the base image for generated Dockerfiles. Unset means use `image`; setting it to
+# a blank string is rejected.
+# base_image = "python:3.12-slim"
+# Tooling installed into a generated image, on top of the base.
+tooling_packages = ["pytest", "pytest-json-report", "coverage", "mutmut"]
+# Pull the base image while building; false assumes it is already present locally.
+pull_base_image = true
+# Allow the build to reach the network (needed to install packages). false builds with
+# network_mode=none, which only works for a base that needs no downloads.
+build_network = true
+# Wall-clock cap for one image build; the wait is abandoned when it is exceeded (best-effort).
+build_timeout_seconds = 900.0
+# Tag prefix for per-run images; tags are content-addressed from the build inputs.
+image_tag_prefix = "janus-sandbox"
+# Remove the per-run image after the run. A "prebuilt" image is never removed.
+remove_image = true
+# Pull the "prebuilt" image if it is not present locally. Set false for local builds.
 pull_image = true
+# How often resource usage is sampled while a command runs (seconds).
+telemetry_sample_interval_seconds = 0.2
+
+# Docker endpoint URL. Unset means docker.from_env() (DOCKER_HOST / the default socket).
+# Point this at a rootless daemon, e.g. unix:///run/user/1000/docker.sock.
+# docker_host = "unix:///run/user/1000/docker.sock"
+# Fail closed unless the daemon is rootless: a run returns error="not_rootless" instead of
+# using a rootful daemon. Off by default so local (plain) Docker still works.
+require_rootless = false
 
 # Source is copied here with `docker cp`; the container runs as this user.
 workdir = "/work"
@@ -31,11 +62,17 @@ pids_limit = 256
 max_output_bytes = 1048576
 
 # Network policy. false = no network at all AND the setup phase is skipped, so only the
-# offline test phase runs. true = the setup phase runs with unrestricted network access.
-# allow_hosts is not enforceable yet (the egress proxy is not built), so setting it while
-# network = true is rejected rather than silently ignored.
+# offline test phase runs. true = the setup phase runs with network access.
+# allow_hosts is enforced by an allowlisting egress proxy (ADR D-059): the sandbox sits on
+# an internal network with no route out and can only reach listed hosts through the proxy.
+# An empty list means any host; a leading-dot entry (".github.com") is a wildcard.
 network = false
 allow_hosts = []
+
+# Egress proxy, used only when network = true and allow_hosts is non-empty.
+proxy_port = 8888        # port the sandbox's proxy environment variables point at
+proxy_memory_mb = 256    # memory cap for the proxy container
+proxy_pids_limit = 128   # process cap for the proxy container
 
 # Phase A (setup, network on) and phase B (test, always offline). Empty = phase skipped.
 setup_command = []

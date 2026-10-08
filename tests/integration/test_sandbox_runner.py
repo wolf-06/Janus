@@ -11,10 +11,11 @@ from pathlib import Path
 
 import docker
 import pytest
+from docker.errors import ImageNotFound
 
 from janus.sandbox.runner import SandboxRunner
-from janus.sandbox.settings import SandboxSettings
-from janus.sandbox.spec import build_spec
+from janus.sandbox.settings import ImageSource, SandboxSettings
+from janus.sandbox.spec import SandboxPhase, build_spec
 
 
 def _docker_available() -> bool:
@@ -33,19 +34,20 @@ IMAGE = "python:3.12-slim"
 
 
 @pytest.fixture
-def runner() -> SandboxRunner:
-    return SandboxRunner()
-
-
-@pytest.fixture
 def settings() -> SandboxSettings:
     return SandboxSettings(
         image=IMAGE,
+        image_source=ImageSource.PREBUILT,
         timeout_seconds=60.0,
         memory_mb=512,
         cpus=1.0,
         pids_limit=128,
     )
+
+
+@pytest.fixture
+def runner(settings: SandboxSettings) -> SandboxRunner:
+    return SandboxRunner(settings=settings)
 
 
 def test_runs_a_command_and_captures_output(
@@ -160,3 +162,90 @@ def test_output_is_redacted(runner: SandboxRunner, settings: SandboxSettings) ->
     result = runner.run(spec)
 
     assert "ghp_" not in result.stdout
+
+
+def test_generated_image_is_built_then_removed(tmp_path: Path) -> None:
+    """A generated image serves exactly one run and is gone afterwards."""
+    (tmp_path / "requirements.txt").write_text("")
+    settings = SandboxSettings(
+        image=IMAGE,
+        image_source=ImageSource.GENERATED,
+        tooling_packages=[],
+        timeout_seconds=60.0,
+        memory_mb=512,
+        cpus=1.0,
+        pids_limit=128,
+    )
+    runner = SandboxRunner(settings=settings)
+    spec = build_spec(settings, command=["python", "-c", "print('built ok')"])
+
+    result = runner.run(spec, source_dir=tmp_path)
+
+    assert result.ok is True, result.stderr
+    assert "built ok" in result.stdout
+    with pytest.raises(ImageNotFound):
+        docker.from_env().images.get(result.image)
+
+
+# --- Host-allowlist enforcement (network topology + allowlisting proxy) ------------------
+
+_DIRECT_EGRESS_SCRIPT = (
+    "import socket\n"
+    "try:\n"
+    "    socket.create_connection(('1.1.1.1', 80), 3)\n"
+    "    print('connected')\n"
+    "except OSError:\n"
+    "    print('blocked')\n"
+)
+
+_CONNECT_SCRIPT = (
+    "import os, socket\n"
+    "url = os.environ['HTTP_PROXY']\n"
+    "authority = url.split('//', 1)[1]\n"
+    "host, port = authority.rsplit(':', 1)\n"
+    "s = socket.create_connection((host, int(port)), 5)\n"
+    "s.sendall(b'CONNECT {target} HTTP/1.1\\r\\nHost: {target}\\r\\n\\r\\n')\n"
+    "print(s.recv(128).decode('latin-1'))\n"
+)
+
+
+def _enforced(settings: SandboxSettings) -> SandboxSettings:
+    return settings.model_copy(update={"network": True, "allow_hosts": ["pypi.org"]})
+
+
+def _run_in_box(settings: SandboxSettings, script: str):
+    spec = build_spec(
+        settings,
+        command=["python", "-c", script],
+        phase=SandboxPhase.SETUP,
+        network=True,
+    )
+    return SandboxRunner(settings=settings).run(spec)
+
+
+def test_enforced_hosts_block_direct_egress(settings: SandboxSettings) -> None:
+    """The sandbox is on an internal network, so it cannot reach the internet directly."""
+    result = _run_in_box(_enforced(settings), _DIRECT_EGRESS_SCRIPT)
+
+    assert result.ok is True, result.stderr
+    assert "blocked" in result.stdout
+    assert "connected" not in result.stdout
+
+
+def test_proxy_refuses_a_disallowed_connect(settings: SandboxSettings) -> None:
+    script = _CONNECT_SCRIPT.format(target="example.com:443")
+
+    result = _run_in_box(_enforced(settings), script)
+
+    assert result.ok is True, result.stderr
+    assert "403" in result.stdout
+
+
+def test_proxy_does_not_refuse_a_listed_connect(settings: SandboxSettings) -> None:
+    """The allowed host is not 403; a lack of internet (502) is tolerated."""
+    script = _CONNECT_SCRIPT.format(target="pypi.org:443")
+
+    result = _run_in_box(_enforced(settings), script)
+
+    assert result.ok is True, result.stderr
+    assert "403" not in result.stdout

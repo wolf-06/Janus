@@ -62,6 +62,13 @@ def test_setup_phase_may_use_the_network() -> None:
     assert spec.network_mode == "bridge"
 
 
+def test_allow_hosts_are_carried_when_the_network_is_on() -> None:
+    settings = SandboxSettings(network=True, allow_hosts=["pypi.org"])
+    spec = build_spec(settings, command=["pip", "install", "-e", "."], phase=SandboxPhase.SETUP)
+
+    assert spec.allow_hosts == ("pypi.org",)
+
+
 def test_result_ok_requires_clean_exit() -> None:
     assert SandboxResult(image="i", phase=SandboxPhase.TEST, exit_code=0).ok is True
     assert SandboxResult(image="i", phase=SandboxPhase.TEST, exit_code=1).ok is False
