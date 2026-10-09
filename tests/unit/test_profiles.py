@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from janus.sandbox.profiles import Profile, build_plan, default_plan
+from janus.sandbox.profiles import Profile, RunPhase, RunPlan, build_plan, default_plan
 from janus.sandbox.settings import SandboxSettings
 from janus.sandbox.spec import SandboxPhase
 
@@ -83,3 +83,35 @@ def test_ambient_flag_is_carried() -> None:
     plan = build_plan(SandboxSettings(), profile=Profile.AMBIENT, ambient_reconstructed=False)
     assert plan.profile is Profile.AMBIENT
     assert plan.ambient_reconstructed is False
+
+
+def test_run_phase_artifacts_default_to_empty() -> None:
+    phase = RunPhase(SandboxPhase.TEST, ("pytest",), False)
+    assert phase.artifacts == ()
+
+
+def test_specs_carry_phase_artifacts() -> None:
+    settings = SandboxSettings(network=True, test_command=["pytest"])
+    plan = RunPlan(
+        profile=Profile.CLEAN,
+        phases=(
+            RunPhase(
+                SandboxPhase.SETUP,
+                ("pip", "install"),
+                True,
+                artifacts=("/work/setup.json",),
+            ),
+            RunPhase(
+                SandboxPhase.TEST,
+                ("pytest",),
+                False,
+                artifacts=("/work/report.json",),
+            ),
+        ),
+    )
+
+    specs = plan.specs(settings)
+
+    assert specs[0].artifacts == ("/work/setup.json",)
+    assert specs[1].artifacts == ("/work/report.json",)
+    assert specs[1].network is False

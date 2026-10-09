@@ -31,11 +31,17 @@ class Profile(StrEnum):
 
 @dataclass(frozen=True)
 class RunPhase:
-    """One command to run in the sandbox."""
+    """One command to run in the sandbox, plus the artifacts it produces.
+
+    ``artifacts`` are the absolute container paths the command writes that the runner reads
+    back before the container is removed. Carrying them here (rather than only on the
+    adapter's ``Command``) means the plan is the single place a spec is materialised from.
+    """
 
     phase: SandboxPhase
     command: tuple[str, ...]
     network: bool
+    artifacts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -57,13 +63,14 @@ class RunPlan:
         return all(phase.phase is not SandboxPhase.SETUP for phase in self.phases)
 
     def specs(self, settings: SandboxSettings) -> tuple[SandboxSpec, ...]:
-        """Materialise the phases into runnable specs."""
+        """Materialise the phases into runnable specs, carrying each phase's artifacts."""
         return tuple(
             build_spec(
                 settings,
                 command=phase.command,
                 phase=phase.phase,
                 network=phase.network,
+                artifacts=phase.artifacts,
             )
             for phase in self.phases
         )

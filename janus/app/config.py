@@ -13,7 +13,7 @@ import os
 import tomllib
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 from pydantic.fields import FieldInfo
@@ -141,6 +141,10 @@ class Settings(BaseSettings):
     # --- Sandbox ---
     # Loaded from the TOML config file; see ``janus/sandbox/settings.py``.
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
+
+    # Which job processor the worker runs: ``stub`` (no-op) or ``sandbox`` (real work in a
+    # container). The sandbox processor is still used only when ``sandbox.enabled`` is true.
+    processor_mode: Literal["stub", "sandbox"] = "stub"
 
     # --- Orchestrator guardrails ---
     # Hard stop for all workers, independent of the DB kill switch.

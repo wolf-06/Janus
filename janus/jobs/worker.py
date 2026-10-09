@@ -218,7 +218,16 @@ def main() -> None:
 
 
 async def _serve(settings: Settings) -> None:
-    worker = Worker(AsyncSessionLocal, settings=settings)
+    # Imported lazily: ``janus.jobs.processor`` imports ``JobResult``/``JobProcessor`` from
+    # this module, so a top-level import here would be circular.
+    if settings.processor_mode == "sandbox":
+        from janus.jobs.processor import build_processor
+
+        processor: JobProcessor = build_processor(settings, AsyncSessionLocal)
+    else:
+        processor = stub_processor
+
+    worker = Worker(AsyncSessionLocal, processor, settings=settings)
     await worker.run()
 
 
