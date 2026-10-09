@@ -17,8 +17,10 @@ Mechanism, in order:
 4. Run the command on a worker thread, streaming its output and bounding each stream at
    ``max_output_bytes`` while sampling resource usage.
 5. Enforce the wall-clock cap by killing the container if the command overruns.
-6. Redact the bounded output, remove the container, remove the per-run image when this call
-   built it, and return a ``SandboxResult``.
+6. Read back any requested artifacts (absolute container paths) as raw bytes, then redact the
+   bounded output, remove the container, remove the per-run image when this call built it, and
+   return a ``SandboxResult``. Artifacts are read before removal because the container is the
+   only place a structured result (a JSON report, coverage data) exists.
 
 Every failure — no daemon, missing image, build failure, overrun — is returned as a result,
 never raised, so a bad sandbox run cannot crash the worker loop.
@@ -45,7 +47,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 import docker
-from docker.errors import DockerException, ImageNotFound
+from docker.errors import DockerException, ImageNotFound, NotFound
 from docker.models.containers import Container
 
 from janus.sandbox.image import (
@@ -136,6 +138,58 @@ def tar_directory(
     buffer = io.BytesIO()
     build_tar(src, buffer, arcname=arcname, exclude=exclude, owner=owner)
     return buffer.getvalue()
+
+
+def _first_regular_member(data: bytes, max_bytes: int) -> tuple[bytes | None, str | None]:
+    """Return the first regular file in a tar ``data``, or an error reason.
+
+    Returns ``(content, None)`` on success, ``(None, reason)`` otherwise. A tar with no regular
+    member (only directories, or empty) is an error, not an empty file.
+    """
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
+        member = next((candidate for candidate in tar.getmembers() if candidate.isfile()), None)
+        if member is None:
+            return None, "unreadable: no regular file in archive"
+        if member.size > max_bytes:
+            return None, "too_large"
+        handle = tar.extractfile(member)
+        if handle is None:
+            return None, "unreadable: no regular file in archive"
+        return handle.read(), None
+
+
+def extract_artifacts(
+    container: Container,
+    paths: Sequence[str],
+    *,
+    max_bytes: int,
+) -> tuple[dict[str, bytes], dict[str, str]]:
+    """Read requested files back out of ``container`` before it is removed.
+
+    For each absolute ``path``, ``get_archive`` returns a tar stream whose first regular member
+    is the file's bytes. A missing path, a member larger than ``max_bytes``, a directory, an
+    empty archive, or any daemon/OS error is recorded in the errors mapping instead of raised —
+    extraction must never break a run. An oversized artifact is reported, never truncated.
+    """
+    artifacts: dict[str, bytes] = {}
+    errors: dict[str, str] = {}
+    for path in paths:
+        try:
+            chunks, _stat = container.get_archive(path)
+            content, reason = _first_regular_member(b"".join(chunks), max_bytes)
+        except NotFound:
+            errors[path] = "not_found"
+            continue
+        except (DockerException, OSError, tarfile.TarError) as exc:
+            errors[path] = f"unreadable: {exc}"
+            continue
+        if reason is not None:
+            errors[path] = reason
+        elif content is not None:
+            artifacts[path] = content
+        else:  # pragma: no cover - defensive; a None/None pair cannot occur
+            errors[path] = "unreadable: no regular file in archive"
+    return artifacts, errors
 
 
 def _error(spec: SandboxSpec, message: str) -> SandboxResult:
@@ -347,6 +401,13 @@ class SandboxRunner:
         Resolves the per-run image and, when it must be built, builds it before the container
         exists. A build context this call created is removed here, so the caller does not own
         it. Blocking. Callers on an event loop must use :meth:`run_in_thread`.
+
+        Any requested ``spec.artifacts`` are read back after the command finishes and before
+        the container is removed. Artifacts are returned **raw, not redacted** — a deliberate
+        carve-out from the "all sandbox output is redacted" rule. They are structured data
+        (a pytest JSON report, a coverage map) that the core parses, and redaction could
+        corrupt them. The adapter must therefore configure its tools to exclude captured
+        output from these files and must redact anything it surfaces from them.
         """
         try:
             client = self._docker()
@@ -436,6 +497,15 @@ class SandboxRunner:
                         .get("State", {})
                         .get("OOMKilled", False)
                     )
+                    artifacts: dict[str, bytes] = {}
+                    artifact_errors: dict[str, str] = {}
+                    if run_spec.artifacts:
+                        # Inside the container's try/finally, so the finally still removes it.
+                        # On the timeout path the container is already killed; a partially
+                        # written artifact is still better than none.
+                        artifacts, artifact_errors = extract_artifacts(
+                            container, run_spec.artifacts, max_bytes=run_spec.max_artifact_bytes
+                        )
                     return SandboxResult(
                         image=run_spec.image,
                         phase=run_spec.phase,
@@ -449,6 +519,8 @@ class SandboxRunner:
                         peak_mem_mb=sample.peak_mem_mb,
                         error=exec_error,
                         command=run_spec.command,
+                        artifacts=artifacts,
+                        artifact_errors=artifact_errors,
                     )
                 finally:
                     _remove(container)

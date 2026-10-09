@@ -164,6 +164,34 @@ def test_output_is_redacted(runner: SandboxRunner, settings: SandboxSettings) ->
     assert "ghp_" not in result.stdout
 
 
+def test_extracts_a_written_artifact(runner: SandboxRunner, settings: SandboxSettings) -> None:
+    spec = build_spec(
+        settings,
+        command=["python", "-c", "open('/work/report.json', 'w').write('report-bytes')"],
+        artifacts=["/work/report.json"],
+    )
+
+    result = runner.run(spec)
+
+    assert result.error is None
+    assert result.artifacts["/work/report.json"] == b"report-bytes"
+    assert result.artifact_errors == {}
+
+
+def test_reports_a_missing_artifact(runner: SandboxRunner, settings: SandboxSettings) -> None:
+    spec = build_spec(
+        settings,
+        command=["python", "-c", "print('nothing to see')"],
+        artifacts=["/work/never-written.json"],
+    )
+
+    result = runner.run(spec)
+
+    assert result.ok is True
+    assert result.artifacts == {}
+    assert result.artifact_errors["/work/never-written.json"] == "not_found"
+
+
 def test_generated_image_is_built_then_removed(tmp_path: Path) -> None:
     """A generated image serves exactly one run and is gone afterwards."""
     (tmp_path / "requirements.txt").write_text("")

@@ -4,8 +4,9 @@ Source: `PLAN.md` §1.2 and §4, implemented via `docs/IMPLEMENTATION_PLAN.md` �
 This spec covers the **sandbox** half of Phase 3: running one command in an ephemeral,
 locked-down container and returning trustworthy facts about it.
 
-Status: **sandbox core implemented.** The adapter interface and the Python adapter are the
-remaining Phase 3 work (see §7).
+Status: **sandbox core implemented.** The adapter interface and the Python adapter are now
+implemented and specified in [`ADAPTER.md`](ADAPTER.md); the sample fixture repo is the remaining
+Phase 3 work and is deferred to Phase 4.
 
 ---
 
@@ -24,6 +25,10 @@ remaining Phase 3 work (see §7).
   allowlisting egress proxy on an internal network.
 - Resource telemetry (peak memory, cumulative CPU seconds).
 - Secret redaction of all sandbox output.
+- Artifact extraction: absolute container paths named by the caller (a pytest JSON report, a
+  coverage file) are read back before the container is removed, so a structured result written
+  *inside* the container is not lost when it is destroyed. Artifacts are returned raw, not
+  redacted — a deliberate carve-out (see §7).
 - Configuration from the TOML config file.
 
 **Non-goals (still Phase 3, but not this spec):**
@@ -65,6 +70,7 @@ memory_mb = 2048
 cpus = 2.0
 pids_limit = 256
 max_output_bytes = 1048576    # per-command stdout/stderr kept
+max_artifact_bytes = 4194304  # per-artifact size cap; larger => too_large, never truncated
 network = false               # false => no network AND setup is skipped
 allow_hosts = []              # enforced by the egress proxy; empty = any host
 proxy_port = 8888             # port the sandbox's proxy env vars point at
@@ -82,8 +88,8 @@ matching the apex (`github.com`) and any subdomain (`api.github.com`); an empty 
 
 Invalid values (blank `image`, blank or whitespace-bearing `image_tag_prefix`, a blank
 `base_image` or `docker_host`, relative `workdir`, non-positive limits including
-`build_timeout_seconds`, `telemetry_sample_interval_seconds`, `proxy_memory_mb`, and
-`proxy_pids_limit`, or a `proxy_port` outside 1..65535) fail at startup.
+`build_timeout_seconds`, `telemetry_sample_interval_seconds`, `max_artifact_bytes`,
+`proxy_memory_mb`, and `proxy_pids_limit`, or a `proxy_port` outside 1..65535) fail at startup.
 
 ---
 
@@ -113,7 +119,14 @@ Invalid values (blank `image`, blank or whitespace-bearing `image_tag_prefix`, a
    polls the stats API meanwhile.
 5. **Time cap** — if the command outlives `timeout_seconds`, kill the container, mark
    `timed_out`, and keep whatever output was already emitted.
-6. **Collect** — redact the bounded output, remove the container, return a `SandboxResult`.
+6. **Extract artifacts** — when the spec names absolute container paths, read each one back with
+   `get_archive` (the API behind `docker cp`) *after* the command finishes and *before* the
+   container is removed. The tar stream's first regular member is the file's bytes. A missing
+   path (`not_found`), a member over `max_artifact_bytes` (`too_large`), a directory, an empty
+   archive, or any daemon error is recorded in `artifact_errors`, never raised and never
+   truncated. Extraction also runs on the timeout path (the container is killed first; a
+   partially written artifact is better than none).
+7. **Collect** — redact the bounded output, remove the container, return a `SandboxResult`.
 
 **Allowlist enforcement (network on with a non-empty `allow_hosts`).** The runner opens a
 `ProxySession` (`janus.sandbox.proxy`), which creates `janus-sbx-<id>` (`internal=True`, no
@@ -142,10 +155,12 @@ the blocking work off the loop.
 
 ## 4. Data
 
-- `SandboxSpec` — image, command, workdir, user, limits, network, phase.
+- `SandboxSpec` — image, command, workdir, user, limits, network, phase, `artifacts` (absolute
+  container paths to read back), and `max_artifact_bytes` (per-artifact cap).
 - `SandboxResult` — exit code, stdout, stderr, duration, `timed_out`, `oom_killed`,
-  `cpu_seconds`, `peak_mem_mb`, `error`, `command`. `ok` is true only for a clean, in-time,
-  zero-exit run with no infrastructure error.
+  `cpu_seconds`, `peak_mem_mb`, `error`, `command`, `artifacts` (path → raw bytes), and
+  `artifact_errors` (path → `not_found` / `too_large` / `unreadable: ...`). `ok` is true only
+  for a clean, in-time, zero-exit run with no infrastructure error.
 - `RunPlan` — profile (`clean`/`ambient`), phases, `ambient_reconstructed`.
 - `NetworkPolicy` — `enabled`, `hosts`, `allows(host)`, `enforced`, `docker_network_mode`;
   `host_allowed(host, allow_hosts)` owns the matching rule.
@@ -175,6 +190,8 @@ the blocking work off the loop.
 | 17 | A rootless requirement fails closed on a rootful daemon | `test_run_returns_not_rootless_when_required_but_absent`; `test_is_rootless_*` |
 | 18 | A host-listed run cannot reach a non-listed host, including directly | `test_enforced_hosts_block_direct_egress`; `test_proxy_refuses_a_disallowed_connect`; `test_proxy_does_not_refuse_a_listed_connect` |
 | 19 | The proxy and both networks are removed after the run | `test_run_with_enforcement_opens_and_closes_a_proxy_session` |
+| 20 | A requested artifact is read back before the container is removed | `test_run_passes_the_spec_artifacts_to_extraction`; `test_extracts_a_written_artifact` |
+| 21 | An unreadable or oversized artifact is reported, never silently dropped, and never truncated | `test_extract_artifacts_reports_a_missing_path`; `test_extract_artifacts_reports_an_oversized_member_without_truncating`; `test_reports_a_missing_artifact` |
 
 ---
 
@@ -189,8 +206,8 @@ the blocking work off the loop.
 | `uv run pytest tests/unit/test_profiles.py` | Two-phase planning; setup skipped when network is off. |
 | `uv run pytest tests/unit/test_sandbox_spec.py` | Spec building and result semantics. |
 | `uv run pytest tests/unit/test_sandbox_image.py` | Dockerfile generation, content-addressed tags, image resolution (no Docker). |
-| `uv run pytest tests/unit/test_sandbox_runner.py` | `tar_directory`, `container_options` (incl. network/env overrides), per-run build/remove, the proxy-session open/close path, streamed-and-bounded output with a full drain, the timeout kill, the sample-interval pass-through, and rootless detection (no Docker). |
-| `uv run pytest tests/integration/test_sandbox_runner.py` | Docker-gated: run, copy, no socket, no network, timeout, limits, per-run build, and allowlist enforcement (direct egress blocked, proxy 403 for a disallowed host). |
+| `uv run pytest tests/unit/test_sandbox_runner.py` | `tar_directory`, `container_options` (incl. network/env overrides), per-run build/remove, the proxy-session open/close path, streamed-and-bounded output with a full drain, the timeout kill, the sample-interval pass-through, artifact extraction with a fake container (regular file, `not_found`, `too_large`, directory, empty tar, unreadable, never raises), the artifact pass-through, and rootless detection (no Docker). |
+| `uv run pytest tests/integration/test_sandbox_runner.py` | Docker-gated: run, copy, no socket, no network, timeout, limits, per-run build, artifact read-back and missing-artifact reporting, and allowlist enforcement (direct egress blocked, proxy 403 for a disallowed host). |
 | `uv run ruff check .` / `uv run ruff format --check .` / `uv run mypy janus` | Clean. |
 
 Docker-gated tests skip themselves when no daemon is reachable, so CI without Docker still
@@ -218,6 +235,19 @@ passes.
   A killed command keeps only the output it had already emitted.
 - **Redaction is best-effort.** Filesystem paths are preserved on purpose (they are
   evidence), which can let a path-shaped secret through.
+- **Artifacts are returned raw by design.** A requested artifact is returned as raw bytes and
+  is *not* redacted: it is structured data (a JSON report, a coverage map) that the core
+  parses, and redaction could corrupt it. This is a deliberate carve-out from the "all sandbox
+  output is redacted" rule. The adapter must therefore configure its tools to exclude captured
+  output from these files and must redact anything it surfaces from them.
+- **Artifacts must be written outside the `/tmp` tmpfs.** The container mounts `/tmp` as a
+  tmpfs, and the daemon's archive API the extractor uses (`get_archive`) cannot read files from
+  that mount, so a path under `/tmp` comes back `not_found`. Adapters therefore write artifacts
+  to a path on the writable root filesystem — the Python adapter uses `/var/tmp/janus`.
+- **Artifacts have a per-file cap.** Each artifact is capped at `max_artifact_bytes`; a larger
+  file is reported as `too_large` and omitted, never truncated, because truncating structured
+  data corrupts it. A path that does not exist is reported as `not_found`; any other failure as
+  `unreadable: ...`. Failures are always reported in `artifact_errors`, never silently dropped.
 - **No read-only rootfs.** `docker cp` cannot write into one; see `DECISIONS.md` D-049.
 - **Build time per run.** Every run builds its own image when the content-addressed tag is
   not cached; there is no published base image (see `DECISIONS.md` D-056). `image_source =

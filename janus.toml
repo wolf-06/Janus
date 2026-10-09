@@ -8,6 +8,11 @@
 # JANUS_CONFIG_FILE at another path to use a different file. Settings can also
 # live under [tool.janus] in pyproject.toml (used when this file is absent).
 
+# Which job processor the worker runs: "stub" (no-op) or "sandbox" (real work in a
+# container). "sandbox" runs the adapter's commands in a locked-down container; it is
+# only used when [sandbox].enabled is true.
+processor_mode = "stub"
+
 [sandbox]
 # Master switch for running work inside a container.
 enabled = true
@@ -23,7 +28,7 @@ image = "python:3.12-slim"
 # a blank string is rejected.
 # base_image = "python:3.12-slim"
 # Tooling installed into a generated image, on top of the base.
-tooling_packages = ["pytest", "pytest-json-report", "coverage", "mutmut"]
+tooling_packages = ["pytest", "pytest-json-report", "coverage", "mutmut", "pytest-cov"]
 # Pull the base image while building; false assumes it is already present locally.
 pull_base_image = true
 # Allow the build to reach the network (needed to install packages). false builds with
@@ -60,6 +65,9 @@ cpus = 2.0
 pids_limit = 256
 # Upper bound on captured stdout/stderr per command (bytes), to bound memory and redaction.
 max_output_bytes = 1048576
+# Per-artifact size cap (bytes) for files read back before the container is removed. A larger
+# artifact is reported as too_large, never truncated (truncating structured data corrupts it).
+max_artifact_bytes = 4194304
 
 # Network policy. false = no network at all AND the setup phase is skipped, so only the
 # offline test phase runs. true = the setup phase runs with network access.

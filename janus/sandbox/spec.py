@@ -39,6 +39,11 @@ class SandboxSpec:
     phase: SandboxPhase = SandboxPhase.TEST
     pull_image: bool = True
     max_output_bytes: int = 1_048_576
+    # Absolute container paths to read back before the container is removed, and the per-file
+    # size cap. A structured result (a pytest JSON report, a coverage file) lives only inside
+    # the container otherwise, since stdout/stderr is all the caller sees.
+    artifacts: tuple[str, ...] = ()
+    max_artifact_bytes: int = 4 * 1024 * 1024
 
     @property
     def network_mode(self) -> str:
@@ -64,6 +69,13 @@ class SandboxResult:
     # non-zero exit from the command itself.
     error: str | None = None
     command: tuple[str, ...] = field(default_factory=tuple)
+    # Requested container paths → raw bytes. Deliberately *not* redacted: these are structured
+    # data the core parses, and redaction could corrupt a report or a coverage map. See
+    # ``SandboxRunner.run``.
+    artifacts: dict[str, bytes] = field(default_factory=dict)
+    # Requested paths that could not be read, mapped to why (``not_found``, ``too_large``,
+    # ``unreadable: ...``). Never silently dropped, and never truncated.
+    artifact_errors: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -77,11 +89,13 @@ def build_spec(
     command: Sequence[str],
     phase: SandboxPhase = SandboxPhase.TEST,
     network: bool | None = None,
+    artifacts: Sequence[str] = (),
 ) -> SandboxSpec:
     """Build a ``SandboxSpec`` from settings.
 
     ``network`` defaults to the phase's intent: setup may use the network, the test phase
-    never does. It is forced off when the configuration forbids network access.
+    never does. It is forced off when the configuration forbids network access. ``artifacts``
+    lists absolute container paths the runner reads back before removing the container.
     """
     if network is None:
         use_network = phase is SandboxPhase.SETUP
@@ -103,4 +117,6 @@ def build_spec(
         phase=phase,
         pull_image=settings.pull_image,
         max_output_bytes=settings.max_output_bytes,
+        artifacts=tuple(artifacts),
+        max_artifact_bytes=settings.max_artifact_bytes,
     )

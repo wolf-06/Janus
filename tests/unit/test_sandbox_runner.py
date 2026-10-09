@@ -6,10 +6,11 @@ import io
 import tarfile
 import threading
 import types
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from docker.errors import DockerException
+from docker.errors import DockerException, NotFound
 
 from janus.sandbox.image import ImageBuildError, ResolvedImage
 from janus.sandbox.proxy import ProxyError
@@ -18,6 +19,7 @@ from janus.sandbox.runner import (
     SandboxRunner,
     _truncate,
     container_options,
+    extract_artifacts,
     is_rootless,
     tar_directory,
 )
@@ -133,6 +135,122 @@ def test_truncate_bounds_output() -> None:
     assert bounded.startswith(b"x" * 10)
     assert b"truncated" in bounded
     assert len(bounded) < 100
+
+
+class _FakeArchiveContainer:
+    """A container whose ``get_archive`` returns canned tar bytes (or raises)."""
+
+    def __init__(self, responses: dict[str, bytes | Exception]) -> None:
+        self._responses = responses
+        self.requested: list[str] = []
+
+    def get_archive(self, path: str) -> tuple[list[bytes], dict[str, object]]:
+        self.requested.append(path)
+        response = self._responses[path]
+        if isinstance(response, Exception):
+            raise response
+        return [response], {"name": path}
+
+
+def _tar_file(name: str, content: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        info = tarfile.TarInfo(name)
+        info.size = len(content)
+        tar.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def _tar_directory_member(name: str) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        info = tarfile.TarInfo(name)
+        info.type = tarfile.DIRTYPE
+        tar.addfile(info)
+    return buffer.getvalue()
+
+
+def _tar_empty() -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w"):
+        pass
+    return buffer.getvalue()
+
+
+def test_extract_artifacts_returns_a_regular_file_byte_for_byte() -> None:
+    container = _FakeArchiveContainer(
+        {"/work/report.json": _tar_file("report.json", b'{"ok":true}')}
+    )
+
+    artifacts, errors = extract_artifacts(container, ["/work/report.json"], max_bytes=1024)
+
+    assert artifacts == {"/work/report.json": b'{"ok":true}'}
+    assert errors == {}
+
+
+def test_extract_artifacts_reports_a_missing_path() -> None:
+    container = _FakeArchiveContainer({"/work/gone.json": NotFound("no such file")})
+
+    artifacts, errors = extract_artifacts(container, ["/work/gone.json"], max_bytes=1024)
+
+    assert artifacts == {}
+    assert errors == {"/work/gone.json": "not_found"}
+
+
+def test_extract_artifacts_reports_an_oversized_member_without_truncating() -> None:
+    container = _FakeArchiveContainer({"/work/big.json": _tar_file("big.json", b"x" * 50)})
+
+    artifacts, errors = extract_artifacts(container, ["/work/big.json"], max_bytes=10)
+
+    assert artifacts == {}
+    assert errors == {"/work/big.json": "too_large"}
+
+
+def test_extract_artifacts_reports_a_directory_member() -> None:
+    container = _FakeArchiveContainer({"/work/dir": _tar_directory_member("dir")})
+
+    artifacts, errors = extract_artifacts(container, ["/work/dir"], max_bytes=1024)
+
+    assert artifacts == {}
+    assert errors["/work/dir"].startswith("unreadable")
+
+
+def test_extract_artifacts_reports_an_empty_archive() -> None:
+    container = _FakeArchiveContainer({"/work/empty": _tar_empty()})
+
+    artifacts, errors = extract_artifacts(container, ["/work/empty"], max_bytes=1024)
+
+    assert artifacts == {}
+    assert errors["/work/empty"].startswith("unreadable")
+
+
+def test_extract_artifacts_reports_a_docker_error() -> None:
+    container = _FakeArchiveContainer({"/work/boom": DockerException("daemon said no")})
+
+    artifacts, errors = extract_artifacts(container, ["/work/boom"], max_bytes=1024)
+
+    assert artifacts == {}
+    assert errors["/work/boom"].startswith("unreadable:")
+
+
+def test_extract_artifacts_never_raises_on_garbage() -> None:
+    container = _FakeArchiveContainer({"/work/junk": b"not a tar at all"})
+
+    artifacts, errors = extract_artifacts(container, ["/work/junk"], max_bytes=1024)
+
+    assert artifacts == {}
+    assert errors["/work/junk"].startswith("unreadable:")
+
+
+def test_extract_artifacts_mixes_successes_and_failures() -> None:
+    container = _FakeArchiveContainer(
+        {"/work/a": _tar_file("a", b"a"), "/work/missing": NotFound("nope")}
+    )
+
+    artifacts, errors = extract_artifacts(container, ["/work/a", "/work/missing"], max_bytes=1024)
+
+    assert artifacts == {"/work/a": b"a"}
+    assert errors == {"/work/missing": "not_found"}
 
 
 async def test_run_in_thread_returns_the_result() -> None:
@@ -354,6 +472,55 @@ def test_a_build_failure_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.error is not None
     assert result.error.startswith("image_build_failed:")
     assert client.container.removed is False
+
+
+def test_run_passes_the_spec_artifacts_to_extraction(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(image_source=ImageSource.PREBUILT, image="python:3.12-slim")
+    runner = SandboxRunner(client=client, settings=settings)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+    calls: list[tuple[object, tuple[str, ...], int]] = []
+
+    def _fake_extract(
+        container: object, paths: Sequence[str], *, max_bytes: int
+    ) -> tuple[dict[str, bytes], dict[str, str]]:
+        calls.append((container, tuple(paths), max_bytes))
+        return {"/work/report.json": b"report"}, {"/work/missing": "not_found"}
+
+    monkeypatch.setattr("janus.sandbox.runner.extract_artifacts", _fake_extract)
+    spec = build_spec(
+        settings, command=["pytest"], artifacts=["/work/report.json", "/work/missing"]
+    )
+
+    result = runner.run(spec)
+
+    assert len(calls) == 1
+    container, paths, max_bytes = calls[0]
+    assert container is client.container
+    assert paths == ("/work/report.json", "/work/missing")
+    assert max_bytes == settings.max_artifact_bytes
+    assert result.artifacts == {"/work/report.json": b"report"}
+    assert result.artifact_errors == {"/work/missing": "not_found"}
+
+
+def test_run_skips_extraction_without_artifacts(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _StubClient(exit_code=0)
+    settings = SandboxSettings(image_source=ImageSource.PREBUILT, image="python:3.12-slim")
+    runner = SandboxRunner(client=client, settings=settings)
+    _patch_image(monkeypatch, build=False, tag="python:3.12-slim")
+    called: list[int] = []
+
+    def _never(*args: object, **kwargs: object) -> tuple[dict[str, bytes], dict[str, str]]:
+        called.append(1)
+        return {}, {}
+
+    monkeypatch.setattr("janus.sandbox.runner.extract_artifacts", _never)
+
+    result = runner.run(build_spec(settings, command=["pytest"]))
+
+    assert called == []
+    assert result.artifacts == {}
+    assert result.artifact_errors == {}
 
 
 def test_exec_bounds_streamed_output_and_drains_the_whole_stream() -> None:

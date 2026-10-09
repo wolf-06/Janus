@@ -44,7 +44,7 @@ class SandboxSettings(BaseModel):
     pull_image: bool = True
     # Tooling installed into a generated image, on top of the base.
     tooling_packages: list[str] = Field(
-        default_factory=lambda: ["pytest", "pytest-json-report", "coverage", "mutmut"]
+        default_factory=lambda: ["pytest", "pytest-json-report", "coverage", "mutmut", "pytest-cov"]
     )
     # Pull the base image while building; False assumes it is already present locally.
     pull_base_image: bool = True
@@ -82,6 +82,10 @@ class SandboxSettings(BaseModel):
     # Upper bound on captured stdout/stderr kept per command, so a chatty (or hostile)
     # test suite cannot blow up memory or redaction time.
     max_output_bytes: int = 1_048_576
+
+    # Upper bound on a single extracted artifact (bytes). A larger file is reported as
+    # ``too_large`` rather than truncated: truncating a structured report corrupts it.
+    max_artifact_bytes: int = 4 * 1024 * 1024
 
     # Network policy. ``network = false`` means no network at all *and* the setup phase is
     # skipped entirely, so only the offline test phase runs.
@@ -146,6 +150,7 @@ class SandboxSettings(BaseModel):
         "memory_mb",
         "pids_limit",
         "max_output_bytes",
+        "max_artifact_bytes",
         "proxy_memory_mb",
         "proxy_pids_limit",
     )
