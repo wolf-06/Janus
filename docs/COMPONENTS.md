@@ -265,12 +265,27 @@ Runs one command in an ephemeral, locked-down container and returns facts about 
 runner knows nothing about pytest: the adapter decides the command, the sandbox just runs
 it. Configuration comes from `janus.toml` (see `DECISIONS.md` D-046).
 
+### Pipeline
+One run, end to end:
+
+1. **Build image** — resolve the per-run image and build it when it is not `prebuilt`; the tag
+   is content-addressed from the Dockerfile, base image, and build-context manifests
+   (`image.py`, ADR D-056).
+2. **Two-phase run** — `RunPlan` yields a setup phase (network on) and an offline test phase;
+   the container is created with dropped capabilities and resource limits, the source is
+   copied in with `docker cp`, and, when `allow_hosts` is set, the container joins an internal
+   network whose only route out is the allowlisting proxy (`proxy.py`, ADR D-059).
+3. **Streamed bounded capture** — stdout/stderr are bounded at `max_output_bytes` as they
+   arrive, and the stream keeps draining so the command cannot block on a full pipe (D-058).
+4. **Redaction** — the bounded output is redacted before it leaves the sandbox, the container
+   is removed, and the per-run image is removed when this run built it.
+
 ### `settings.py` — `SandboxSettings`
 Image, work dir, run user, wall-clock timeout, resource limits, network policy, output cap,
-and the setup/test commands. Validators reject blank names, a relative `workdir`,
-non-positive limits, and `network = true` combined with a non-empty `allow_hosts` (host
-restrictions cannot be enforced yet, so the config fails closed). A bad config fails at
-startup rather than mid-run.
+egress-proxy limits (`proxy_port`, `proxy_memory_mb`, `proxy_pids_limit`), and the
+setup/test commands. Validators reject blank names, a relative `workdir`, non-positive
+limits, and a `proxy_port` outside 1..65535. A bad config fails at startup rather than
+mid-run.
 
 ### `spec.py` — `SandboxSpec` / `SandboxResult`
 `SandboxSpec` is a frozen description of one run (image, command, limits, network, phase,
@@ -280,15 +295,38 @@ configuration forbids it. `SandboxResult` carries the exit code, stdout/stderr, 
 telemetry, timeout/OOM flags, and an `error` for infrastructure failures. Both are plain
 data, so they are cheap to log and test without Docker.
 
+### `image.py` — per-run image
+`resolve_image` picks the source: `prebuilt` uses `image` as-is; `repo` requires a root
+Dockerfile; `generated` writes a Janus Dockerfile; `auto` prefers a repo Dockerfile and
+generates otherwise. A generated image is built from a temp context holding only the manifest
+files it `COPY`s (never the source), and the tag is content-addressed from the Dockerfile,
+base image, and those manifests, so identical inputs reuse a tag. The build runs on a worker
+thread and is abandoned after `build_timeout_seconds` (best-effort). The caller removes the
+context after the build and the image after the run; a `prebuilt` image is never removed
+(ADR D-056).
+
 ### `allowlist.py` — `NetworkPolicy`
 No network by default. When enabled, an empty host list means "any host" (the install
-phase). `docker_network_mode()` is the single mapping from "network allowed" to a Docker
-network mode, used by both `NetworkPolicy` and `SandboxSpec`.
+phase); a non-empty list is *enforced* (`enforced`) by the egress proxy. `host_allowed()`
+owns the matching rule (exact, case-insensitive, trailing-dot-insensitive, leading-dot
+wildcard, empty = any). `docker_network_mode()` is the single mapping from "network allowed"
+to a Docker network mode, used by both `NetworkPolicy` and `SandboxSpec`.
+
+### `proxy.py` — `ProxySession` / allowlisting proxy
+Implements host-list enforcement (ADR D-059): two run-owned networks (an `internal=True` one
+for the sandbox + proxy, a normal bridge for the proxy's upstream egress), a standard-library
+asyncio proxy that allows plain HTTP and `CONNECT` only to listed hosts and answers `403`
+otherwise, and teardown of sandbox → proxy → networks. The proxy image is shared and
+content-addressed (`proxy_image_tag`), built once and never removed; the per-run host list is
+passed via `JANUS_PROXY_ALLOW_HOSTS`.
 
 ### `redaction.py` — `redact` / `redact_bytes`
-Four checks, cheapest first: PEM blocks, known token shapes (GitHub, AWS, Slack, OpenAI,
-JWTs, `user:pass@host`), `KEY=value` lines whose key looks secret-ish (including quoted JSON
-keys), and long high-entropy strings. Filesystem paths are deliberately preserved — they are
+Six checks, cheapest and most certain first: PEM blocks; known token shapes (GitHub, GitLab,
+AWS, Slack, Stripe, Google, npm, HuggingFace, Docker, PyPI, SSH key material, JWTs,
+`user:pass@host`); `Authorization: Bearer`/`Basic` credentials (the scheme word is kept);
+`KEY=value` lines whose key looks secret-ish (including quoted JSON keys); long high-entropy
+strings; and high-entropy path *segments*, which redact a random-looking segment in place
+while the path structure survives. Filesystem paths are deliberately preserved — they are
 evidence the triage stage needs. Everything leaving the sandbox passes through it.
 Best-effort by design.
 
@@ -306,13 +344,17 @@ CPU seconds. Docker's stats API returns nothing after exit, so sampling while th
 runs is the reliable option; the injected callable keeps it Docker-free and testable.
 
 ### `runner.py` — `SandboxRunner`
-`ensure_image` (honouring `spec.pull_image`) → `create` (via the pure `container_options`)
+`resolve_image`/`build_image` (per-run, D-056) → `create` (via the pure `container_options`)
 → `start` → stream the source in with `put_archive` from a spooled temp file, entries owned
-by the run user → `exec_run` on a worker thread → kill on timeout → truncate → redact →
-`remove`. The root keepalive creates and `chmod 0777`s the work dir, because capabilities
-are dropped and a runtime `chown` cannot work (D-054). No host bind mounts and never the
-Docker socket. Every failure mode returns a `SandboxResult` with an `error`, never raises;
-event-loop callers use `run_in_thread`.
+by the run user → stream the command on a worker thread, bounding each stream at
+`max_output_bytes` while draining the rest (D-058) → kill on timeout → redact → `remove`.
+When `allow_hosts` is set the container joins a `ProxySession`'s internal network instead of a
+bridge. The client comes from `docker_host` when set, else `docker.from_env()`, and
+`require_rootless` fails closed with `error="not_rootless"` before any container exists
+(D-057). The root keepalive creates and `chmod 0777`s the work dir, because capabilities are
+dropped and a runtime `chown` cannot work (D-054). No host bind mounts and never the Docker
+socket. Every failure mode returns a `SandboxResult` with an `error`, never raises; event-loop
+callers use `run_in_thread`.
 
 ---
 

@@ -255,14 +255,19 @@ bound; a 429 storm causes zero lost jobs.
 
 ### Phase 3 — Sandbox runner + adapter interface
 **Status:** the **sandbox core is done** — TOML-configured settings, `SandboxSpec`/
-`SandboxResult`, network policy, secret redaction, two-phase `RunPlan`, stats sampling, and
-the container runner (`janus/sandbox/*`); see `docs/specs/SANDBOX.md`. Remaining: the
+`SandboxResult`, a fresh per-run image build (repo Dockerfile or Janus-generated;
+content-addressed, removed afterwards; ADR D-056), two-phase `RunPlan`, streamed and bounded
+output (D-058), rootless support via `docker_host`/`require_rootless` (D-057), an enforced
+host allowlist via an internal network plus an allowlisting proxy (D-059), stats sampling, and
+secret redaction (`janus/sandbox/*`); see `docs/specs/SANDBOX.md`. Remaining: the
 `core/adapter.py` Protocol + conformance suite, the Python adapter, and the `JobProcessor`
 wiring.
-**Build:** rootless Docker runner (ephemeral, network-isolated with allowlist, read-only
-mounts, CPU/mem/pids/time caps, **no `docker.sock` in sandbox**); clone via
-installation token with a credential helper (token never in URL); cgroup telemetry;
-secret redaction pipeline; `core/adapter.py` Protocol; Python adapter (pytest,
+**Build:** ephemeral container runner that builds a fresh per-run image (repo Dockerfile or
+Janus-generated, content-addressed, removed afterwards), streams and bounds command output,
+supports rootless Docker via `docker_host`/`require_rootless`, and enforces the host allowlist
+with an internal network plus an allowlisting proxy (CPU/mem/pids/time caps, **no `docker.sock`
+in sandbox**); clone via installation token with a credential helper (token never in URL);
+cgroup telemetry; secret redaction pipeline; `core/adapter.py` Protocol; Python adapter (pytest,
 coverage.py contexts, mutmut).
 **Acceptance:** sample repo runs under pytest in the sandbox and returns structured
 results + telemetry; redaction unit tests (secrets/`.env`/high-entropy); caps enforced;

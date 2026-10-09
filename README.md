@@ -71,26 +71,39 @@ The processor is a no-op stub; the reproduce/triage/fix brain plugs in at S1/S2
 Sandbox behaviour is configured in [`janus.toml`](janus.toml) (or `[tool.janus]` in
 `pyproject.toml`; set `JANUS_CONFIG_FILE` to use another path). Environment variables
 override the file, with nested keys using a double underscore, e.g.
-`JANUS_SANDBOX__IMAGE=janus/python:3.12`.
+`JANUS_SANDBOX__IMAGE=python:3.12-slim`.
 
 ```toml
 [sandbox]
-image = "janus/python:3.12"   # Janus-owned base image
-timeout_seconds = 900.0       # wall-clock cap for one command
+image_source = "auto"          # auto | repo | generated | prebuilt (see ADR D-056)
+image = "python:3.12-slim"     # the "prebuilt" image, and the generated base by default
+# base_image = "python:3.12-slim"  # override the generated base (unset => use `image`)
+tooling_packages = ["pytest", "pytest-json-report", "coverage", "mutmut"]
+remove_image = true            # remove the per-run image after the run
+build_network = true           # allow the build network (needed to install packages)
+build_timeout_seconds = 900.0  # wall-clock cap for one image build
+timeout_seconds = 900.0        # wall-clock cap for one command
 memory_mb = 2048
 cpus = 2.0
 pids_limit = 256
-max_output_bytes = 1048576    # per-command stdout/stderr kept
-network = false               # false => no network AND the setup phase is skipped
-setup_command = []            # phase A (network on)
-test_command = []             # phase B (always offline)
+max_output_bytes = 1048576     # per-command stdout/stderr kept
+telemetry_sample_interval_seconds = 0.2
+# docker_host = "unix:///run/user/1000/docker.sock"  # point at a rootless daemon
+require_rootless = false       # true => fail closed unless the daemon is rootless
+network = false                # false => no network AND the setup phase is skipped
+allow_hosts = []               # enforced by the allowlisting egress proxy; empty = any host
+setup_command = []             # phase A (network on)
+test_command = []              # phase B (always offline)
 ```
 
 A run is up to two phases: **setup** installs dependencies with the network on, **tests**
 always run offline. If `network` is false, setup is skipped and only the offline test phase
-runs. The container never receives the Docker socket and no host path is bind-mounted.
-Output is redacted before it leaves the sandbox, and host allowlists are rejected until the
-egress proxy exists (the config fails closed).
+runs. Each run builds its own image (from the repository Dockerfile or a Janus-generated one)
+and removes it afterwards; `image_source = "prebuilt"` uses `image` as-is. When `network` is
+true and `allow_hosts` is non-empty, the run joins an internal network whose only route out is
+an allowlisting proxy, so only the listed hosts are reachable (ADR D-059). The container never
+receives the Docker socket and no host path is bind-mounted. Output is streamed, bounded at
+`max_output_bytes`, and redacted before it leaves the sandbox.
 
 The Docker-gated sandbox tests skip themselves when no daemon is reachable:
 

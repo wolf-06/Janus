@@ -764,6 +764,8 @@ short-lived peaks (the interval bounds resolution). *Reversible:* yes.
 
 ### D-051 — A Janus-owned base image
 
+Superseded by D-056.
+
 **Context.** Runs must be repeatable and reasonably fast.
 
 **Decision.** Default to a Janus-owned image (`janus/python:3.12`) with pytest, coverage.py
@@ -775,6 +777,8 @@ and mutmut preinstalled, configurable in the TOML file.
 `pull_image = false` supports locally built images. *Reversible:* yes.
 
 ### D-052 — Fail closed on an unenforceable host allowlist
+
+Superseded by D-059.
 
 **Context.** The egress allowlist proxy is not built, but `allow_hosts` exists in the config
 and reads as an enforced restriction. `network = true` produces an unrestricted bridge.
@@ -840,3 +844,108 @@ container — needs output streaming, deferred.
 **Consequences.** (+) Worker memory and redaction time are bounded; the loop stays
 responsive when wired. (−) Output is still buffered by `exec_run` before truncation.
 *Reversible:* yes.
+
+### D-056 — Build a fresh image per sandbox run
+
+**Context.** D-051 defaulted to a Janus-owned base image (`janus/python:3.12`), but no such
+image is published anywhere, so every run failed to pull it. Runs need an environment that
+exists without a build-and-publish pipeline we do not have.
+
+**Decision.** Drop the published base image. Each run resolves its own image and, when it is
+not `prebuilt`, builds it fresh: from a `Dockerfile` at the repository root when one exists,
+otherwise from a Janus-generated Dockerfile (base `python:3.12-slim` plus configurable
+tooling and optional dependency install). The tag is content-addressed from the Dockerfile,
+the base image, and the build-context manifests, so identical inputs reuse a tag. The image
+is used for that one run and removed afterwards. The source is still copied in at run time
+with `docker cp` (D-047); the image never bakes in the source. `prebuilt` remains an escape
+hatch that uses `settings.image` unchanged and is never removed.
+
+**Alternatives.** Publish and maintain a Janus base image — needs a registry and a release
+pipeline, and it still cannot know a repo's dependencies. Pull `python:3.12-slim` and install
+per run without building — same cost, but loses the repo-Dockerfile path and content-addressed
+caching. Bind-mount the source into the build — bakes the source into a layer and exposes a
+host path.
+
+**Consequences.** (+) No external image dependency; the environment is derived from the repo
+and the config, and is reproducible via the content-addressed tag. (+) `prebuilt` keeps a fast
+path for a known image. (−) Every run pays the build cost when the tag is not cached, and a
+Docker daemon with build support is required. *Reversible:* yes (set `image_source =
+"prebuilt"`).
+
+### D-057 — Rootless Docker is the target, plain Docker is the local default
+
+**Context.** Running the daemon as root means a container escape is a host-root escape, so the
+intended deployment is rootless Docker. Local development, however, usually has a plain daemon
+reachable at the default socket, and we do not want to break it.
+
+**Decision.** Add a `docker_host` setting: when set, the runner builds its client with
+`docker.DockerClient(base_url=docker_host)`; when unset it uses `docker.from_env()`. Add
+`require_rootless` (default `false`): when true, `run()` checks the daemon's `SecurityOptions`
+for a `rootless` entry and, if absent, returns `error="not_rootless"` without creating a
+container — it never raises. Host setup (enabling rootless, cgroup v2 delegation) is not
+automated.
+
+**Alternatives.** Assume rootless and read `DOCKER_HOST` only — makes local plain-Docker runs
+awkward and hides the choice. Refuse to run at all without rootless — blocks local development.
+Detect rootless and silently downgrade — hides a security-relevant difference.
+
+**Consequences.** (+) The same code targets a rootless daemon in production and a plain daemon
+locally, with the choice made in config. (+) `require_rootless` fails closed where it matters.
+(−) Rootless detection depends on the daemon reporting `SecurityOptions`; a daemon that omits
+it is treated as rootful, which is the safe default. *Reversible:* yes.
+
+### D-058 — Bound sandbox output while streaming, not after capture
+
+**Context.** D-055 truncated output to `max_output_bytes`, but only *after* `exec_run` had
+buffered the command's entire output in the daemon and SDK. A command that prints gigabytes
+would still be buffered in full before any bound applied, so the cap did not actually bound
+memory.
+
+**Decision.** Run the command with streaming exec (`exec_create` + `exec_start(stream=True,
+demux=True)`), accumulate each stream up to `max_output_bytes`, then keep draining the stream
+and discard the excess so the command cannot block on a full pipe. A truncated stream gets the
+existing `[... output truncated ...]` marker. The exec is inspected after the stream ends to
+recover the real exit code, because `container.exec_run(..., stream=True)` returns
+`exit_code=None`. `_truncate` stays as a final safety net. The wall-clock cap is unchanged:
+kill the container on overrun and keep the output already emitted.
+
+**Alternatives.** Keep buffering then truncate — the daemon holds unbounded output (the bug).
+Use `container.exec_run(..., stream=True)` — the SDK drops the exit code when streaming.
+Kill the stream at the cap — a full pipe would block the command.
+
+**Consequences.** (+) Memory and redaction time are bounded by `max_output_bytes` regardless of
+how chatty the command is; the stream is always drained so the command never stalls. (−) The
+exec must go through the low-level API to keep the exit code, and a killed command keeps only
+its already-emitted output. *Reversible:* yes.
+
+### D-059 — Enforce the host allowlist with an internal network plus an allowlisting proxy
+
+**Context.** `allow_hosts` was recorded but not enforced, so D-052 rejected `network = true`
+with a non-empty host list rather than let the config overstate its isolation. A host list is
+only useful if a listed run physically cannot reach anything else.
+
+**Decision.** When a run has `network = true` and a non-empty `allow_hosts`, the runner opens a
+`ProxySession` that creates two user-defined Docker networks owned by the run:
+`janus-sbx-<id>` with `internal=True` (no route to the outside) and `janus-sbx-up-<id>`, a
+normal bridge. An allowlisting proxy container is attached to **both**; the sandbox is attached
+**only** to the internal network, with `HTTP_PROXY`/`HTTPS_PROXY`/`http_proxy`/`https_proxy`
+pointing at `http://<proxy-name>:8888`. The proxy accepts plain HTTP and `CONNECT`, checks the
+target host against the allow list, and answers `403` otherwise. Because the sandbox is not on
+the upstream network, direct egress fails even if it ignores the proxy variables — the topology,
+not the proxy alone, enforces the policy. The proxy image is shared and content-addressed over
+the Dockerfile and the script template (not the per-run host list), built once and never
+removed; the per-run list is passed to the container as `JANUS_PROXY_ALLOW_HOSTS`. Teardown is
+sandbox → proxy → both networks, always, in a `finally`. The D-052 fail-closed validator is
+removed: `network = true` with a host list is now valid and enforced. The host-matching rule
+(exact, case-insensitive, trailing-dot-insensitive, leading-dot wildcard, empty = any) lives in
+`janus.sandbox.allowlist.host_allowed` and is embedded as data in the proxy script.
+
+**Alternatives.** Rely on the proxy alone (proxy environment variables) — a sandbox that clears
+them escapes the allow list. A per-run proxy image embedding the host list — no image reuse. A
+transparent iptables/DOCKER-USER ruleset — needs host privileges and is not portable to
+rootless Docker.
+
+**Consequences.** (+) A host-listed run cannot reach a non-listed host, including directly; the
+proxy and both networks are removed after the run. (+) The proxy image is built once and shared.
+(−) The proxy is HTTP/HTTPS-only, so non-HTTP egress through it is not possible and other
+protocols simply fail. *Reversible:* yes.
