@@ -1,0 +1,17 @@
+{
+  "meta": {
+    "format": 3,
+    "version": "7.6.1",
+    "timestamp": "2024-10-15T10:00:00"
+  },
+  "contexts": {
+    "tests/test_math.py::test_subtract": [
+      ["src/math.py", [1, 2, 4, 5]],
+      ["src/ops.py", [0, -1, 2]]
+    ],
+    "tests/test_ops.py::test_divide": [
+      ["src/math.py", [1, 2]],
+      ["src/ops.py", [3, 4]]
+    ]
+  }
+}

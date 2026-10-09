@@ -1,0 +1,15 @@
+running mutation testing
+- Mutation #1: killed
+- Mutation #2: killed
+- Mutation #3: killed
+- Mutation #4: killed
+- Mutation #5: killed
+- Mutation #6: killed
+- Mutation #7: killed
+- Mutation #8: killed
+- Mutation #9: survived
+- Mutation #10: survived
+
+Killed: 8
+Survived: 2
+Total: 10
