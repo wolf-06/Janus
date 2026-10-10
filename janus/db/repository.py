@@ -7,14 +7,27 @@ decisions in one place.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, Insert
+from sqlalchemy import CursorResult, Insert, case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from janus.db.models import Delivery, Diagnosis, Installation, Repository, Run
+from janus.db.models import (
+    Delivery,
+    Diagnosis,
+    Fix,
+    GateResult,
+    Installation,
+    Job,
+    Repository,
+    Reproduction,
+    Run,
+    Signal,
+    Suspect,
+)
 
 
 async def upsert_installation(
@@ -162,3 +175,142 @@ async def create_diagnosis(
     session.add(diagnosis)
     await session.flush()
     return diagnosis
+
+
+async def set_diagnosis(
+    session: AsyncSession,
+    *,
+    job_id: int,
+    route: str,
+    confidence: float,
+    top2_gap: float,
+    evidence: dict[str, Any] | None = None,
+) -> Diagnosis:
+    """Upsert the single triage outcome for a job (one diagnosis row per job)."""
+    existing = await session.scalar(select(Diagnosis).where(Diagnosis.job_id == job_id))
+    if existing is None:
+        return await create_diagnosis(
+            session,
+            job_id=job_id,
+            route=route,
+            confidence=confidence,
+            top2_gap=top2_gap,
+            evidence=evidence,
+        )
+    existing.route = route
+    existing.confidence = confidence
+    existing.top2_gap = top2_gap
+    existing.evidence = evidence or {}
+    await session.flush()
+    return existing
+
+
+async def add_reproductions(
+    session: AsyncSession, job_id: int, reproductions: Sequence[Reproduction]
+) -> list[Reproduction]:
+    """Attach rerun evidence rows to a job; flush, never commit."""
+    for reproduction in reproductions:
+        reproduction.job_id = job_id
+    session.add_all(reproductions)
+    await session.flush()
+    return list(reproductions)
+
+
+async def add_signals(
+    session: AsyncSession, job_id: int, signals: Sequence[Signal]
+) -> list[Signal]:
+    """Attach scored triage signals to a job; flush, never commit."""
+    for signal in signals:
+        signal.job_id = job_id
+    session.add_all(signals)
+    await session.flush()
+    return list(signals)
+
+
+async def add_suspects(
+    session: AsyncSession, job_id: int, suspects: Sequence[Suspect]
+) -> list[Suspect]:
+    """Attach ranked suspects to a job; flush, never commit."""
+    for suspect in suspects:
+        suspect.job_id = job_id
+    session.add_all(suspects)
+    await session.flush()
+    return list(suspects)
+
+
+async def add_fix(
+    session: AsyncSession,
+    *,
+    job_id: int,
+    suspect_id: int | None,
+    attempt: int,
+    diff: str,
+    status: str,
+) -> Fix:
+    """Record a generated fix attempt; flush, never commit."""
+    fix = Fix(
+        job_id=job_id,
+        suspect_id=suspect_id,
+        attempt=attempt,
+        diff=diff,
+        status=status,
+    )
+    session.add(fix)
+    await session.flush()
+    return fix
+
+
+async def add_gate_results(
+    session: AsyncSession, fix_id: int, results: Sequence[GateResult]
+) -> list[GateResult]:
+    """Attach proof/policy gate outcomes to a fix; flush, never commit."""
+    for result in results:
+        result.fix_id = fix_id
+    session.add_all(results)
+    await session.flush()
+    return list(results)
+
+
+async def set_run_pr_number(session: AsyncSession, run_id: int, pr_number: int | None) -> Run:
+    """Store the pull request a failing run belongs to (``None`` when absent)."""
+    run = await session.get(Run, run_id)
+    if run is None:
+        raise LookupError(f"run {run_id} not found")
+    run.pr_number = pr_number
+    await session.flush()
+    return run
+
+
+async def flake_history(
+    session: AsyncSession, repo_id: int, target_ids: Sequence[str]
+) -> dict[str, float]:
+    """Historical failure rate per target for a repository's past reproductions.
+
+    For each requested target id this is failed attempts / total attempts across the
+    repository's ``reproductions`` rows (joined to ``jobs`` on ``repo_id``). Full-suite
+    rows (``target_id IS NULL``) are ignored. Every requested id is present in the
+    result; ids with no history map to ``0.0``. An empty request short-circuits to ``{}``
+    without querying. Flush-only, like the rest of this module: no commit.
+    """
+    requested = list(dict.fromkeys(target_ids))
+    if not requested:
+        return {}
+
+    failed = func.sum(case((Reproduction.passed.is_(False), 1), else_=0))
+    statement = (
+        select(Reproduction.target_id, func.count(), failed)
+        .join(Job, Job.id == Reproduction.job_id)
+        .where(
+            Job.repo_id == repo_id,
+            Reproduction.target_id.is_not(None),
+            Reproduction.target_id.in_(requested),
+        )
+        .group_by(Reproduction.target_id)
+    )
+    rows = (await session.execute(statement)).all()
+
+    rates: dict[str, float] = {target_id: 0.0 for target_id in requested}
+    for target_id, total, failures in rows:
+        if target_id is not None and total:
+            rates[target_id] = failures / total
+    return rates

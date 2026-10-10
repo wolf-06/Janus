@@ -13,6 +13,38 @@
 # only used when [sandbox].enabled is true.
 processor_mode = "stub"
 
+# --- Triage (Phase 4 / S1) ---
+# Rerun each failing target k_reruns times, then run the full suite once at the end.
+k_reruns = 5
+# Decision thresholds: argmax must reach tau, and the top two routes must differ by more
+# than epsilon, otherwise the route is UNSURE (PLAN.md §1.2).
+tau = 0.80
+epsilon = 0.05
+# Name of the Check run Janus posts with the triage verdict.
+triage_check_name = "Janus triage"
+# Post the evidence comment on the PR when the failing run belongs to one.
+comment_on_pr = true
+# Cap each signal's details payload so stored JSON stays bounded.
+max_signal_detail_chars = 2000
+
+# --- Fix loop (Phase 5/6 / S2) ---
+# "suggest" comments only; "pr" opens a PR with the verification table.
+fix_mode = "suggest"
+# Ranked suspects considered per job, and fix attempts per suspect.
+max_suspects = 5
+max_fix_attempts = 3
+# Run `git bisect` in the sandbox to find the introducing commit.
+bisect_enabled = false
+
+# --- LLM (used by S2 diff generation) ---
+# OpenAI-compatible endpoint; unset uses the client default.
+llm_model = "gpt-4o-mini"
+llm_timeout_seconds = 60.0
+llm_max_tokens = 4096
+# Secrets: set these via the environment (JANUS_LLM_API_KEY), never in this file.
+# llm_base_url = "https://api.openai.com/v1"
+# llm_api_key = "sk-..."
+
 [sandbox]
 # Master switch for running work inside a container.
 enabled = true

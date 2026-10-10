@@ -119,6 +119,8 @@ class Run(Base):
     conclusion: Mapped[str] = mapped_column(String(32))
     baseline_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event: Mapped[str] = mapped_column(String(64))
+    # The pull request the failing run belongs to, when the event carries one.
+    pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     repository: Mapped[Repository] = relationship(back_populates="runs")
@@ -174,6 +176,10 @@ class Job(Base):
 
     run: Mapped[Run] = relationship(back_populates="jobs")
     diagnoses: Mapped[list[Diagnosis]] = relationship(back_populates="job")
+    reproductions: Mapped[list[Reproduction]] = relationship(back_populates="job")
+    signals: Mapped[list[Signal]] = relationship(back_populates="job")
+    suspects: Mapped[list[Suspect]] = relationship(back_populates="job")
+    fixes: Mapped[list[Fix]] = relationship(back_populates="job")
 
 
 class Diagnosis(Base):
@@ -202,3 +208,96 @@ class SystemFlag(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class Reproduction(Base):
+    """One sandbox attempt of a job: rerun evidence, not a verdict.
+
+    ``target_id`` is the failing target rerun under a profile; ``NULL`` means the
+    full-suite run. Telemetry (exit code, timing, cgroup CPU/memory) is captured per
+    attempt so the triage signals can be scored from durable evidence.
+    """
+
+    __tablename__ = "reproductions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    profile: Mapped[str] = mapped_column(String(16))
+    attempt_index: Mapped[int] = mapped_column(Integer)
+    target_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    passed: Mapped[bool] = mapped_column(Boolean)
+    duration_s: Mapped[float] = mapped_column(Float)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timed_out: Mapped[bool] = mapped_column(Boolean, default=False)
+    oom_killed: Mapped[bool] = mapped_column(Boolean, default=False)
+    cpu_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    peak_mem_mb: Mapped[float] = mapped_column(Float, default=0.0)
+    stdout_excerpt: Mapped[str] = mapped_column(Text, default="")
+    stderr_excerpt: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    job: Mapped[Job] = relationship(back_populates="reproductions")
+
+
+class Signal(Base):
+    """A scored triage signal attached to a job (name + summary + structured details)."""
+
+    __tablename__ = "signals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    summary: Mapped[str] = mapped_column(Text)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    job: Mapped[Job] = relationship(back_populates="signals")
+
+
+class Suspect(Base):
+    """A ranked ``file:line`` suspect from SBFL, optionally with the introducing commit."""
+
+    __tablename__ = "suspects"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    file: Mapped[str] = mapped_column(String(1024))
+    line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    score: Mapped[float] = mapped_column(Float)
+    rank: Mapped[int] = mapped_column(Integer)
+    introducing_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    job: Mapped[Job] = relationship(back_populates="suspects")
+
+
+class Fix(Base):
+    """A generated source-only diff for a suspect, plus its lifecycle status."""
+
+    __tablename__ = "fixes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
+    suspect_id: Mapped[int | None] = mapped_column(
+        ForeignKey("suspects.id", ondelete="SET NULL"), nullable=True
+    )
+    attempt: Mapped[int] = mapped_column(Integer)
+    diff: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    job: Mapped[Job] = relationship(back_populates="fixes")
+
+
+class GateResult(Base):
+    """The outcome of one proof/policy gate for a fix (measured vs baseline)."""
+
+    __tablename__ = "gate_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fix_id: Mapped[int] = mapped_column(ForeignKey("fixes.id", ondelete="CASCADE"), index=True)
+    gate: Mapped[str] = mapped_column(String(64))
+    passed: Mapped[bool] = mapped_column(Boolean)
+    measured_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    baseline_value: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

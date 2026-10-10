@@ -171,6 +171,39 @@ class Settings(BaseSettings):
     # Phase-2 stub processor latency (seconds); replaced by the real brain in S1/S2.
     stub_processing_seconds: float = 0.0
 
+    # --- Triage (Phase 4 / S1) ---
+    # Rerun each failing target this many times, then run the full suite once at the end
+    # (PLAN.md §1.2).
+    k_reruns: int = 5
+    # The argmax route must score at least tau; if the top two are within epsilon the
+    # decision is UNSURE (PLAN.md §1.2).
+    tau: float = 0.80
+    epsilon: float = 0.05
+    # Name of the Check run Janus posts with the triage verdict.
+    triage_check_name: str = "Janus triage"
+    # Post the evidence comment on the PR when the failing run belongs to one.
+    comment_on_pr: bool = True
+    # Cap each signal's ``details`` payload so stored JSON stays bounded.
+    max_signal_detail_chars: int = 2000
+
+    # --- Fix loop (Phase 5/6 / S2) ---
+    # ``suggest`` comments only; ``pr`` opens a PR with the verification table.
+    fix_mode: Literal["suggest", "pr"] = "suggest"
+    # Ranked suspects considered per job, and fix attempts per suspect.
+    max_suspects: int = 5
+    max_fix_attempts: int = 3
+    # Run ``git bisect`` in the sandbox to find the introducing commit.
+    bisect_enabled: bool = False
+
+    # --- LLM (used by S2 diff generation) ---
+    # OpenAI-compatible endpoint; unset uses the client default. ``llm_api_key`` is a
+    # secret and should come from the environment, never the TOML file.
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str = "gpt-4o-mini"
+    llm_timeout_seconds: float = 60.0
+    llm_max_tokens: int = 4096
+
     @classmethod
     def settings_customise_sources(
         cls,

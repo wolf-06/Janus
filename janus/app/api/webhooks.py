@@ -29,6 +29,7 @@ from janus.db.repository import (
     get_or_create_run,
     record_delivery,
     set_run_baseline,
+    set_run_pr_number,
     upsert_installation,
     upsert_repository,
 )
@@ -89,6 +90,23 @@ def _is_failed_workflow_run(payload: dict[str, Any]) -> bool:
     return run.get("conclusion") in _FAILURE_CONCLUSIONS
 
 
+def _pr_number(run_data: dict[str, Any]) -> int | None:
+    """The PR the run belongs to, from ``workflow_run.pull_requests[0].number``.
+
+    Returns ``None`` when the field is missing or malformed rather than failing ingest.
+    """
+    pull_requests = run_data.get("pull_requests")
+    if not isinstance(pull_requests, list) or not pull_requests:
+        return None
+    first = pull_requests[0]
+    if not isinstance(first, dict):
+        return None
+    number = first.get("number")
+    if isinstance(number, bool) or not isinstance(number, int):
+        return None
+    return number
+
+
 async def _ingest(
     settings: Settings,
     session: AsyncSession,
@@ -135,6 +153,7 @@ async def _ingest(
         conclusion=run_data.get("conclusion") or "",
         event=run_data.get("event") or "push",
     )
+    await set_run_pr_number(session, run_id, _pr_number(run_data))
     await enqueue(
         session,
         delivery_id=key,
