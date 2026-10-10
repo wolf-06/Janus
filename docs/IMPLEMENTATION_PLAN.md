@@ -254,14 +254,17 @@ attempt), per-repo daily sandbox/LLM budgets → `skipped_budget` + comment.
 bound; a 429 storm causes zero lost jobs.
 
 ### Phase 3 — Sandbox runner + adapter interface
-**Status:** the **sandbox core is done** — TOML-configured settings, `SandboxSpec`/
-`SandboxResult`, a fresh per-run image build (repo Dockerfile or Janus-generated;
-content-addressed, removed afterwards; ADR D-056), two-phase `RunPlan`, streamed and bounded
-output (D-058), rootless support via `docker_host`/`require_rootless` (D-057), an enforced
-host allowlist via an internal network plus an allowlisting proxy (D-059), stats sampling, and
-secret redaction (`janus/sandbox/*`); see `docs/specs/SANDBOX.md`. Remaining: the
-`core/adapter.py` Protocol + conformance suite, the Python adapter, and the `JobProcessor`
-wiring.
+**Status:** **done** apart from the **sample fixture repo**, which is deferred to Phase 4. The
+sandbox core is complete — TOML-configured settings, `SandboxSpec`/`SandboxResult`, a fresh per-run
+image build (repo Dockerfile or Janus-generated; content-addressed, removed afterwards; ADR D-056),
+two-phase `RunPlan`, streamed and bounded output (D-058), rootless support via
+`docker_host`/`require_rootless` (D-057), an enforced host allowlist via an internal network plus an
+allowlisting proxy (D-059), stats sampling, secret redaction, and **artifact extraction** (declared
+container paths read back before removal; ADR D-060) (`janus/sandbox/*`); see
+`docs/specs/SANDBOX.md`. The **adapter layer** is implemented too: the `core/adapter.py` Protocol +
+conformance suite, the **Python adapter** (pytest, coverage.py contexts, mutmut), and the
+**`JobProcessor` wiring** (`SandboxProcessor`, built by `build_processor`, selected by
+`processor_mode`; ADR D-061…D-064); see `docs/specs/ADAPTER.md`.
 **Build:** ephemeral container runner that builds a fresh per-run image (repo Dockerfile or
 Janus-generated, content-addressed, removed afterwards), streams and bounds command output,
 supports rootless Docker via `docker_host`/`require_rootless`, and enforces the host allowlist

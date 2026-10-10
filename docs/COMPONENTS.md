@@ -5,8 +5,8 @@ another. For the first-principles framing see [`ARCHITECTURE.md`](ARCHITECTURE.m
 the reasoning behind individual choices see [`DECISIONS.md`](DECISIONS.md). This document
 is the "working manual": it explains behaviour, not just structure.
 
-Scope: **S0 (spine) + Phase 2 (orchestration) + the Phase 3 sandbox core**. Everything under
-`janus/core/`, `janus/adapters/` and the fix surfaces is still a stub.
+Scope: **S0 (spine) + Phase 2 (orchestration) + Phase 3 (the sandbox, the adapter protocol and
+the Python adapter)**. The reproducer, the triage brain and the fix surfaces are still stubs.
 
 ---
 
@@ -358,7 +358,52 @@ callers use `run_in_thread`.
 
 ---
 
-## 8. Cross-cutting behaviours
+## 8. `janus/core` + `janus/adapters` — the adapter layer
+
+The core is language-agnostic; everything language-specific sits behind `janus/core/adapter.py`.
+An adapter is a **pure translator** (D-061): it converts CI logs, sandbox results and tool
+artifacts into the core's small types, and the core's intent back into commands. It owns no
+sandbox and no policy — the core owns the runner, the K=5 loop, retries and caps.
+
+### `janus/core/adapter.py` — the Protocol
+Defines `Command(argv, artifacts)` and the language-neutral data (`TestTarget`, `TestOutcome`,
+`CoverageContext`, `MutationResult`) plus the `Adapter` Protocol (parse failing tests; build
+setup/test/coverage/mutation commands; parse results/coverage/mutation). Three contract rules
+bind every adapter, and the conformance suite enforces them: **argv lists, never shell strings**;
+**every parser is total** (malformed input yields `[]`/zeroed, never raises); **no policy**. A
+command declares the absolute container paths it writes (`Command.artifacts`), so a structured
+report leaves the container through the artifact channel (D-060), not stdout scraping.
+
+### `janus/adapters/python/**` — the Python adapter
+`PythonAdapter` composes three translators: `pytest_runner.py` (parse `FAILED`/`ERROR` node ids
+from a CI log; a `--json-report` test command; parse outcomes from the report artifact),
+`coverage.py` (one `--cov-context=test` run producing a JSON report; parse its `contexts` into
+`CoverageContext`s — D-062), and `mutmut.py` (a mutation command; parse killed/survived from
+stdout, since the cache path is unknown to the adapter). All artifact paths are under
+`/var/tmp/janus` on the container's writable rootfs — **not** `/tmp`, which is a tmpfs the
+artifact extractor cannot read back. `tests/conformance/python_case.py` registers the adapter
+with the reusable conformance suite in `tests/conformance/`.
+
+### `janus/source.py` — acquiring the checkout
+`SourceSpec` names the repo, ref and installation; `SourceProvider` is a context-manager factory
+yielding a checkout that is removed on exit. `LocalSourceProvider` wraps an existing directory;
+`GitSourceProvider` clones over HTTPS with the installation token supplied as an
+`http.extraHeader` **through the environment** (`GIT_CONFIG_*`), so the token never appears in a
+URL or argv, with `GIT_TERMINAL_PROMPT=0` and a temp `HOME` for a deterministic environment
+(D-063).
+
+### `janus/jobs/processor.py` — the sandbox processor
+`SandboxProcessor` (built by `build_processor`, selected by `processor_mode`) gathers evidence
+for a job: it loads the repo/run rows, **acquires the source off the event loop** (one
+`asyncio.to_thread` spans acquire → run → parse, and the source context always exits), builds the
+sandbox phase specs from the adapter's commands (setup only when the sandbox allows the network;
+the test phase offline), runs them with `SandboxRunner`, parses the test result with the adapter,
+and returns a `JobResult`. It is evidence only — no triage, no scoring and no new tables; a
+failing suite is the expected input, so only an infrastructure failure is retryable (D-064).
+
+---
+
+## 9. Cross-cutting behaviours
 
 - **Idempotency.** Webhook redeliveries are deduped by the `deliveries` PK; a job is
   one-per-delivery (`jobs.delivery_id` unique). Both are database constraints, not
@@ -377,14 +422,16 @@ callers use `run_in_thread`.
 
 ---
 
-## 9. Still stubbed / deferred
+## 10. Still stubbed / deferred
 
 The triage brain and the rest of the backend track. See [`FUTURE.md`](FUTURE.md) for the
 full ledger. In short:
 
-- **Product brain (S1):** `janus/core/**` (reproducer, signals, triage), the adapter
-  Protocol (`janus/core/adapter.py`), `janus/adapters/python/**`, `janus/report/comment.py`,
-  `janus/config/janus_yml.py`, and wiring the sandbox into `JobProcessor`.
+- **Product brain (S1):** `janus/core/**` (reproducer, signals, triage),
+  `janus/report/comment.py` and `janus/config/janus_yml.py`. The sample fixture repo
+  (`tests/fixtures/`) is deferred to Phase 4. The adapter Protocol
+  (`janus/core/adapter.py`) and the Python adapter (`janus/adapters/python/**`) are
+  **implemented**, and the sandbox is wired into `JobProcessor` via `processor_mode`.
 - **Fix loop (S2):** `janus/core/{localize,retrieve,generate,prove}`, `janus/report/pr.py`.
 - **Backend D4–D6:** fairness/rate limits/budgets (`janus/jobs/{ratelimit,budgets}.py`),
   dedup, observability (`janus/observability/`), load test (`bench/`), Redis, and

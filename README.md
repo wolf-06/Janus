@@ -18,10 +18,12 @@ The **backend pipeline** (D1–D3 of the backend spec) is built: idempotent inge
 a Postgres-as-queue with leases/heartbeat/reaper, retries with full jitter, dead-letter
 with admin requeue, cost caps, quotas and a kill switch. The **sandbox core** (Phase 3) is
 built too: TOML-configured, two-phase container runs with `docker cp`, resource limits,
-telemetry and secret redaction. The triage brain (reproduce, classify, fix, PR) and the
-language adapter are stubbed and tracked in [`docs/FUTURE.md`](docs/FUTURE.md). Backend
-spec: [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
-[`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md).
+telemetry and secret redaction. The **adapter layer** is built: the `Adapter` protocol, its
+conformance suite and the Python adapter. The triage brain (reproduce, classify, fix, PR) is
+stubbed and tracked in [`docs/FUTURE.md`](docs/FUTURE.md). Backend spec:
+[`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
+[`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md); adapter spec:
+[`docs/specs/ADAPTER.md`](docs/specs/ADAPTER.md).
 
 ## Requirements
 
@@ -63,8 +65,22 @@ curl -s localhost:8000/admin/dead
 curl -s -X POST localhost:8000/admin/jobs/<id>/requeue
 ```
 
-The processor is a no-op stub; the reproduce/triage/fix brain plugs in at S1/S2
+The processor is a no-op stub by default; the reproduce/triage/fix brain plugs in at S1/S2
 (see `docs/FUTURE.md`).
+
+## Adapter and processor
+
+The core is language-agnostic: everything language-specific sits behind the `Adapter` protocol in
+`janus/core/adapter.py`, which turns CI logs, sandbox results and tool artifacts into neutral types
+and the core's intent into argv commands. An adapter is a **pure translator** — it holds no sandbox
+and no policy. The **Python adapter** (`janus/adapters/python/`) is implemented: pytest (JSON
+report), coverage.py contexts and mutmut, with structured reports read back as container artifacts
+under `/var/tmp/janus`.
+
+By default the worker runs the no-op `stub` processor. Set `processor_mode = "sandbox"` (in
+`janus.toml`, or `JANUS_PROCESSOR_MODE=sandbox`) to make the worker run real work in a container:
+acquire the source, run the adapter's commands, parse the outcomes. It gathers evidence only —
+triage arrives in Phase 4.
 
 ## Sandbox configuration
 

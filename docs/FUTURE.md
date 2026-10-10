@@ -68,12 +68,15 @@ brain (S1/S2) plugs into the worker without changing the pipeline.
   one, content-addressed and removed afterwards (ADR D-056); output is streamed and bounded
   (D-058); rootless Docker is supported via `docker_host`/`require_rootless` (D-057); the host
   allowlist is enforced with an internal network plus an allowlisting proxy (D-059); and
-  secrets are redacted. What remains for Phase 3 is only: the `Adapter` Protocol + conformance
-  suite, the Python adapter (pytest, coverage.py contexts, mutmut), and the `JobProcessor`
-  wiring.
-- **Adapter interface (Phase 3):** `core/adapter.py` Protocol, the adapter conformance
-  suite, and the Python adapter (pytest, coverage.py contexts, mutmut); then wire the
-  sandbox into `JobProcessor`.
+  secrets are redacted.
+- **Adapter interface (Phase 3):** *done* — `core/adapter.py` Protocol, the adapter
+  conformance suite (`tests/conformance/`), and the Python adapter (pytest JSON report,
+  coverage.py contexts, mutmut); the sandbox is wired into `JobProcessor` and selected by
+  `processor_mode` (ADR D-061…D-064). Phase 3 is now complete **except the sample fixture
+  repo**, which is deferred to Phase 4: it will hold a passing, a failing and a flaky test
+  plus a `requirements.txt`, and it must set `norecursedirs` (e.g. in
+  `[tool.pytest.ini_options]`) so pytest does not collect its tests as part of Janus's own
+  suite.
 - **Reproducer (Phase 4):** K=5 reruns of failing targets + one full-suite run; `clean`
   and `ambient` profiles.
 - **7 signal collectors + scorer:** determinism, signatures, exit codes, resources, change

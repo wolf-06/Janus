@@ -949,3 +949,152 @@ rootless Docker.
 proxy and both networks are removed after the run. (+) The proxy image is built once and shared.
 (−) The proxy is HTTP/HTTPS-only, so non-HTTP egress through it is not possible and other
 protocols simply fail. *Reversible:* yes.
+
+---
+
+## Adapter & processor decisions (Phase 3)
+
+### D-060 — Read artifacts back from the container before removal
+
+**Context.** A test run's useful result is often a *structured file*, not stdout: a pytest JSON
+report, a coverage map, a mutation report. Only stdout/stderr is captured by ``exec_run``, and the
+container is ephemeral — once it is removed the file is gone. Scraping a report out of the command's
+printed output is fragile (the tool may not print it, and the output is bounded by
+``max_output_bytes``, so a large report would be truncated and unparsable).
+
+**Decision.** A ``SandboxSpec`` may name ``artifacts`` (absolute container paths) and a per-file
+``max_artifact_bytes`` cap. After the command finishes and **before** the container is removed, the
+runner reads each path back with ``get_archive`` (the API behind ``docker cp``) into
+``SandboxResult.artifacts`` (``path -> raw bytes``); a path that cannot be read is recorded in
+``SandboxResult.artifact_errors`` (``not_found``, ``too_large``, ``unreadable: ...``) and never
+raised. An artifact larger than the cap is reported ``too_large`` and omitted, **never truncated**:
+truncating structured data (a JSON document, a coverage map) corrupts it. Extraction also runs on
+the timeout path (the container is killed first; a partial artifact beats none). Artifacts are
+returned **raw, not redacted** — a deliberate, documented carve-out from the "all sandbox output is
+redacted" rule, because redacting a structured report could corrupt it; the adapter configures its
+tools to omit captured output and redacts anything it later surfaces. Artifacts must be written to a
+path on the container's writable **root filesystem** (the adapter uses ``/var/tmp/janus``), because
+``/tmp`` is a tmpfs and the daemon's ``get_archive`` endpoint cannot read files from that mount — a
+report written under ``/tmp`` comes back ``not_found``.
+
+**Alternatives.** Parse the report from stdout — loses large/structured reports to output bounding,
+and couples the core to each tool's print format. Keep the container alive and read it out of band —
+lifecycle and cleanup risk, and it breaks the "one ephemeral container per run" model. Redact
+artifacts like other output — would corrupt the very data the core needs to parse. Truncate an
+oversized artifact — produces a report that parses to garbage.
+
+**Consequences.** (+) The core gets the tool's real structured output without scraping stdout, and a
+missing or oversized file is a reported, total outcome rather than a crash or a silent loss. (+)
+Extraction is bounded and Docker-free to unit-test (a fake container drives the whole path). (−)
+Every artifact must be declared on the command and written to a rootfs path, so a tool that only
+writes under ``/tmp`` needs the adapter to redirect it. *Reversible:* yes.
+
+### D-061 — The adapter is a pure translator, and a command declares its artifacts
+
+**Context.** The core (reproducer, signals, triage, SBFL, fix loop) must stay language-agnostic, so
+every Python-specific detail has to sit behind one boundary. That boundary also has to carry the
+structured artifacts D-060 introduced, or the core cannot get a report back.
+
+**Decision.** ``janus/core/adapter.py`` defines an ``Adapter`` Protocol and the language-neutral
+types (``Command``, ``TestTarget``, ``TestOutcome``, ``CoverageContext``, ``MutationResult``). An
+adapter is a **pure translator**: it converts CI logs, sandbox results and artifacts into those
+types, and the core's intent back into commands. It holds **no sandbox and no policy** — the core
+owns the runner, the K=5 loop, retries and caps. A ``Command`` is ``argv`` (an argv list) plus
+``artifacts`` (the absolute container paths it writes that the runner reads back). Three contract
+rules bind every adapter, and the conformance suite in ``tests/conformance/`` enforces all three:
+(1) **commands are argv lists, never shell strings** — the runner execs them with no shell, so no
+element may contain a shell metacharacter; (2) **every parser is total** — malformed, empty or
+truncated input yields ``[]`` or a zeroed result and never raises; (3) **the adapter holds no
+policy** — it never decides whether or how often to run, which profile to use, or what a result
+means for triage. The Python adapter (``janus/adapters/python/``) is the first implementation; a
+Node adapter is later "one new folder" plus a conformance case.
+
+**Alternatives.** Let the adapter own the sandbox/runner — drags language specifics into the core
+and makes the conformance suite untestable without Docker. Parse reports from stdout instead of
+declaring artifacts — see D-060. Put policy (retries, profiles) in the adapter — splits the
+reproduction decision across languages.
+
+**Consequences.** (+) The core stays language-agnostic; a new language is a folder plus a
+conformance case, and the suite is non-vacuous (a ``FakeAdapter`` must pass every check). (+) The
+artifact channel is part of the interface, so a structured report is declared, not guessed. (−)
+Adapters must keep parsers total and commands argv-only; the conformance suite is the guardrail.
+*Reversible:* yes.
+
+### D-062 — Per-test coverage from a single ``--cov-context=test`` run
+
+**Context.** SBFL (Phase 5) needs per-test coverage: which lines each test executed, so failing and
+passing tests can be compared per file/line. The naive way to get that is one instrumented run per
+test, which multiplies sandbox time by the number of tests.
+
+**Decision.** The Python adapter produces per-test coverage from **one** pytest run with
+``--cov-context=test`` (via ``pytest-cov``), writing a JSON report that carries a ``contexts``
+mapping (test id → per-file executed lines). ``parse_coverage`` reads that artifact into
+``CoverageContext`` objects; non-positive line numbers are dropped and malformed input yields no
+context. The command declares the report path as its artifact (D-060), and the report is written
+under ``/var/tmp/janus``, not ``/tmp``.
+
+**Alternatives.** One run per test with plain coverage — N sandbox runs for one suite, far slower
+and capped by the same time limits. No coverage — SBFL would have no input, blocking the S2
+localizer.
+
+**Consequences.** (+) Per-test coverage costs one extra run, not one per test; the whole SBFL input
+arrives as a single declared artifact. (−) It depends on ``pytest-cov`` being in the image, so
+``pytest-cov`` was added to ``tooling_packages`` (the generated-image default and ``janus.toml``).
+*Reversible:* yes.
+
+### D-063 — Source is cloned with an environment-supplied credential header
+
+**Context.** The worker must check out the exact revision a failing run points at, from a private
+repository, using a GitHub App installation token. ``PLAN.md`` §4 requires that the token never
+leak — a token in a clone URL or in argv shows up in process listings, logs and error messages.
+
+**Decision.** ``GitSourceProvider`` clones over HTTPS and passes the installation token as an
+``http.extraHeader`` git config value supplied through the environment (``GIT_CONFIG_COUNT`` /
+``GIT_CONFIG_KEY_0=http.extraHeader`` / ``GIT_CONFIG_VALUE_0=<Authorization: Basic …>``), so the
+token is absent from the clone URL and from every argv. A bad token fails fast instead of prompting
+(``GIT_TERMINAL_PROMPT=0``), and the environment is minimal and deterministic (``GIT_CONFIG_NOSYSTEM=1``
+plus a temp ``HOME``) so the host's git config cannot leak in or change behaviour. ``credential_header``
+builds the ``x-access-token:<token>`` Basic value. The checkout is created in a temp dir and removed
+when the context manager exits; ``LocalSourceProvider`` wraps an existing directory for tests.
+
+**Alternatives.** Put the token in the clone URL (``https://x-access-token:<token>@…``) — leaks into
+process listings and logs. Pass it via ``-c http.extraHeader=…`` on the argv — same leak. Rely on a
+credential helper or the host's git config — non-deterministic and host-dependent.
+
+**Consequences.** (+) The token exists only in the child process's environment for the duration of
+one command, never in a URL, an argv or an error message. (+) A missing ``git``, a timeout, or a
+non-zero exit becomes a ``SourceError`` that names the argv and return code but never the token.
+(−) The provider must construct the environment explicitly, so a git invocation that needs another
+variable has to add it. *Reversible:* yes.
+
+### D-064 — A sandbox processor replaces the stub behind ``processor_mode``
+
+**Context.** Phase 2 shipped ``stub_processor`` — the worker's mechanics (claims, leases, retries,
+caps) were proven, but the processor did nothing. With the sandbox and the adapter in place, the
+worker can run real work, but the triage brain (Phase 4) does not exist yet, so the processor must
+stay explicitly evidence-gathering, not verdict-making.
+
+**Decision.** Add ``SandboxProcessor`` (``janus/jobs/processor.py``) and a ``build_processor``
+factory; select it with ``processor_mode`` (``stub`` default, ``sandbox``) in ``Settings`` and
+``janus.toml``; ``janus.jobs.worker._serve`` picks the processor from that setting. For one job the
+processor loads the repository and run rows, acquires the source **off the event loop** (one
+``asyncio.to_thread`` covers acquire → run → parse, and the source context is always exited), builds
+the sandbox phase specs from the adapter's commands (setup only when the sandbox allows the network;
+the test phase offline), runs them with ``SandboxRunner``, parses the test result with the adapter,
+and reports through ``JobResult``. ``RunPhase``/``RunPlan`` carry each phase's artifacts, and a
+disabled sandbox yields the stub. This is **evidence gathering only**: there is no triage and no
+scoring, and **no new tables** — a failing suite is the expected input and a *successful* job that
+gathered evidence, so only an infrastructure failure (no daemon, image build failure, timeout) is a
+retryable failure. Phase 4 adds the reproducer (the K=5 loop and profiles) and the persistence for
+its evidence.
+
+**Alternatives.** Make the stub the only processor until Phase 4 — leaves the sandbox and adapter
+unwired and unexercised end to end. Let the processor triage too — premature; the signals and scorer
+are Phase 4. Add persistence now — the reproducer owns the schema for its evidence.
+
+**Consequences.** (+) ``processor_mode = "sandbox"`` makes the worker run real work in a container
+while the default stays a safe no-op; the processor is fully injectable (session factory, adapter,
+source provider, runner) so it is unit-tested with fakes. (+) The blocking sequence never blocks the
+event loop and never leaks a checkout. (−) Until Phase 4 there is no reproducer and no stored
+evidence, so a job's result is only counts and a short summary in ``JobResult``. *Reversible:* yes
+(set ``processor_mode = "stub"``).
