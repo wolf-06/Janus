@@ -1,0 +1,45 @@
+# Per-repository Janus configuration for the S1 sample repository.
+#
+# This file is committed next to the code and read by Janus as untrusted repository
+# content. It MUST NOT contain secrets: tokens, credentials and webhook secrets belong in
+# the process environment (JANUS_* variables), never here.
+#
+# Every key is optional. Omitting a key — or setting it to `null` — means "fall back to the
+# process-wide setting" configured by the environment. Unknown keys are preserved as-is so
+# a newer config read by an older Janus is not rejected.
+#
+# The schema is implemented in janus/config/janus_yml.py.
+
+# "suggest" comments only; "pr" additionally opens a pull request. Default: suggest.
+mode: suggest
+
+# How many times each failing target is rerun while reproducing (must be >= 1).
+k_reruns: 3
+
+# Confidence threshold in [0, 1] for accepting a route. Below it (or when the top two routes
+# are within `epsilon`) the verdict is UNSURE. Default process-wide value: 0.80.
+tau: 0.8
+
+# If the top two route scores are within this gap the verdict is UNSURE. Must be in [0, 1].
+epsilon: 0.05
+
+# Per-failure cost caps (must be positive). Exceeding a cap means "comment only".
+max_sandbox_minutes: 30
+max_llm_tokens: 200000
+
+# Commands are argv lists, never shell strings: Janus execs them without a shell. An empty
+# list (or an omitted key) skips the phase. The sample repo is stdlib-only, so setup is a
+# no-op install from an empty requirements file.
+setup_command:
+  - python
+  - -m
+  - pip
+  - install
+  - -r
+  - requirements.txt
+
+test_command:
+  - python
+  - -m
+  - pytest
+  - -q

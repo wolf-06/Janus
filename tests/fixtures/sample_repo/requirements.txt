@@ -1,0 +1,2 @@
+# Intentionally empty: the S1 sample repository is stdlib-only so the sandbox image
+# build stays fast. No third-party packages are required to run its tests.

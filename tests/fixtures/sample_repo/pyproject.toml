@@ -1,0 +1,10 @@
+[project]
+name = "janus-sample-repo"
+version = "0.0.0"
+description = "The S1 seed repository: a tiny stdlib-only Python repo with a known logic bug."
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

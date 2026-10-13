@@ -1,25 +1,17 @@
-# `tests/fixtures/` — placeholder
+# `tests/fixtures/`
 
-This directory is intentionally almost empty. The **sample fixture repo** it will hold is
-**deferred to Phase 4** (S1 reproduce + triage) so the adapter work in Phase 3 is not
-blocked on it.
+Fixtures for Janus's own tests. Nothing here is collected by Janus's suite.
 
-## What will live here
+## `sample_repo/`
 
-When it lands, the fixture is a tiny self-contained Python repository:
+The **S1 seed repository** — a tiny, stdlib-only Python repo the sandbox builds and runs.
+It carries one deterministic logic bug plus a control, a driven (non-random) flake and an
+infrastructure-failure case, so each triage route has a real input. See
+`sample_repo/README.md` for the file list and how each test is driven.
 
-- a **passing** test,
-- a **failing** test (a deterministic logic bug),
-- a **flaky** test (fails intermittently, to exercise determinism scoring),
-- a `requirements.txt`.
-
-It is the input the reproducer runs under both the `clean` and `ambient` profiles and the
-repo the Python-adapter integration test runs against inside the sandbox.
-
-## When it lands
-
-Set `norecursedirs` in `[tool.pytest.ini_options]` (in `pyproject.toml`) so pytest does
-**not** collect the fixture repo's own tests as part of Janus's suite, e.g.:
+Its own tests are **meant to fail**, so `norecursedirs` in `[tool.pytest.ini_options]`
+(in `pyproject.toml`) excludes this directory — otherwise pytest would collect them as part
+of Janus's suite:
 
 ```toml
 [tool.pytest.ini_options]
@@ -27,8 +19,7 @@ testpaths = ["tests"]
 norecursedirs = ["tests/fixtures"]
 ```
 
-Nothing here should be importable by Janus's own tests or collected by `pytest`.
+## `recorded/`
 
-## Status
-
-No repo and no test files exist here yet — this README is the only file.
+Recorded tool outputs (pytest JSON reports, a CI log, a coverage contexts file, mutmut
+stdout) used by the adapter unit tests. These are data, not tests.
