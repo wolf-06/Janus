@@ -1098,3 +1098,183 @@ source provider, runner) so it is unit-tested with fakes. (+) The blocking seque
 event loop and never leaks a checkout. (−) Until Phase 4 there is no reproducer and no stored
 evidence, so a job's result is only counts and a short summary in ``JobResult``. *Reversible:* yes
 (set ``processor_mode = "stub"``).
+
+---
+
+## Reproduce & triage decisions (Phase 4 / S1)
+
+### D-065 — The reproducer runs the failing-target set K times plus one full-suite run
+
+**Context.** Triage has to know whether a red build is a stable, reproducible failure (a code
+bug) or a nondeterministic one (a flaky test), and it needs a measurement cheap enough to fit
+inside the per-failure sandbox-minute cap. Rerunning each failing target K times individually
+would multiply sandbox time by the number of failing targets; a single rerun cannot separate
+deterministic from intermittent at all.
+
+**Decision.** ``janus/core/reproducer.py`` reruns the **failing-target set** K times — one
+sandbox run per attempt that exercises every failing target together — then makes **one
+full-suite run** at the end. K comes from ``.janus.yml`` (``k_reruns``) or the process setting
+(``Settings.k_reruns``, default 5); a value ``<= 0`` is clamped to 1 with a warning. Each rerun
+is flattened into one :class:`~janus.core.evidence.RunAttempt` per parsed test outcome, and the
+full suite is a single ``RunAttempt`` with ``target_id = None``. When the sandbox itself fails
+(no test-phase result, a ``SandboxResult.error``, or a timeout) the reproducer records **one
+failed attempt per requested target** with ``sandbox_error`` set and ``passed = False``, so the
+determinism signal can see that the sandbox — not the code — was unhealthy; a normal red suite
+(non-zero exit, no infra error) is *not* a sandbox failure. ``cost_minutes`` is the sum of every
+sandbox run's ``duration_s`` divided by 60, which is what the per-repo cost cap accounts
+against. The reproducer makes no triage decision and persists nothing.
+
+**Alternatives.** Rerun each failing target K times separately — K×N sandbox runs, unbounded by
+the number of failing tests. Rerun the set once — cannot distinguish deterministic from
+intermittent. Skip the full suite — loses the "is the whole suite red" fact and the control
+baseline. Let an infrastructure failure raise — turns an unhealthy sandbox into a job failure
+instead of evidence.
+
+**Consequences.** (+) Cost is K + 1 sandbox runs regardless of how many targets failed, so it is
+predictable against the cap. (+) The K attempts give the determinism signal its always-fail /
+intermittent / passes-always classification, and the single full-suite run gives a whole-suite
+outcome. (+) A sandbox-level failure is recorded as evidence, never an exception. (−) A target
+that only misbehaves under the full suite is seen K times in isolation; the one full-suite run is
+the only cross-check. *Reversible:* yes.
+
+### D-066 — Evidence is a separate type from the verdict
+
+**Context.** The reproducer, the seven collectors and the scorer must be built and tested
+independently, and the pipeline must never let a measurement quietly become a claim. ``PLAN.md``
+§4 requires "no claim without a gate", and the schema already separates facts
+(``reproductions``) from judgement (``diagnoses``).
+
+**Decision.** ``janus/core/evidence.py`` carries **measured facts only**: ``RunAttempt`` (one
+run of one target), ``Reproduction`` (the K attempts plus the full-suite run, with the derived
+``failure_rate()`` / ``always_fails()`` / ``intermittent()`` / ``passes_always()``),
+``CommitSummary`` and ``ChangeSummary`` (the last-green → first-red range, with ``available``
+false when there is no baseline). None carries a route or a confidence. The **judgement** lives
+in ``janus/core/triage/routes.py``: ``Route`` and ``TriageDecision``, produced by ``decide``. A
+collector's ``SignalEvidence`` sits between the two — it carries per-route **support votes** (a
+measurement of how much it supports each route), never a chosen route, and ``clamp_votes``
+guarantees ``UNSURE`` is never voted. The scorer is the only place votes become scores, and
+``decide`` is the only place a route is chosen.
+
+**Alternatives.** Let the reproducer return a route — couples measurement to judgement and makes
+the reproducer untestable in isolation. Put a confidence on ``Reproduction`` — a fact type would
+carry an opinion. Let collectors pick the route — seven places to get the decision rule wrong.
+
+**Consequences.** (+) The three layers can be built and unit-tested against one frozen surface;
+each fact row in ``reproductions`` / ``signals`` maps to a pure dataclass while only
+``diagnoses`` holds a route, so a reviewer can point at exactly where a claim is made. (−) The
+scorer must re-derive everything from votes, so a collector cannot express a hard veto — it can
+only vote strongly. *Reversible:* yes.
+
+### D-067 — Signals vote per route and aggregate by weighted average over present signals
+
+**Context.** Seven collectors contribute evidence of very different strength, and not every
+collector applies to every failure (there may be no baseline diff, or no flake history).
+Aggregation must not punish a failure for the signals that *could not* be measured, and
+``UNSURE`` must be the decision rule's output alone — not something a collector can vote for.
+
+**Decision.** Each collector returns ``SignalEvidence.votes``, a mapping of the three real
+routes (``TRIAGE_ROUTES``) to support in ``[0, 1]``; a route absent from the mapping means
+support ``0``, and ``clamp_votes`` drops any ``UNSURE`` key and clamps the rest.
+``janus/core/triage/scorer.py::aggregate`` computes, for each real route,
+``sum(weight × vote) / sum(weight of the signals that reported)`` — the denominator covers only
+the **present** signals, so a collector that returns ``None`` (abstains) does not dilute the
+score toward zero, and a signal whose name is not a key in the weights is ignored entirely.
+``UNSURE`` is never a key of the aggregate; it is produced only by ``decide`` (``top score <
+tau`` or ``top2_gap < epsilon``). The default weights (``DEFAULT_WEIGHTS``, sum 1.0) are:
+determinism ``0.22``, signatures ``0.18``, change_attribution ``0.16``, exit_codes ``0.14``,
+correlation ``0.10``, flake_history ``0.10``, resources ``0.10`` — the two strongest
+discriminators weigh most, and change attribution (the direct code evidence) is third.
+
+**Alternatives.** Fix the denominator at the sum of all seven weights — a missing signal drags
+every score toward zero and biases the run to ``UNSURE``. Majority vote across collectors —
+ignores that the signals are not equally informative and cannot express partial support. Let a
+collector vote ``UNSURE`` — gives seven ways to pre-empt the decision rule. An unnormalised
+weighted sum — the score would not be comparable to ``tau`` in ``[0, 1]``.
+
+**Consequences.** (+) An absent signal is neutral, not contradicting, so a sparse failure can
+still reach a real route on the evidence it does have. (+) The decision rule and the tie-break
+live in exactly one place (``routes.decide``). (−) Because the denominator adapts, the same
+absolute votes yield different scores depending on which signals reported; the per-signal
+``reasons`` in the comment make the composition visible. *Reversible:* yes (weights and
+``tau``/``epsilon`` are configurable).
+
+### D-068 — The verdict is a Check run, with a PR comment when the run has a PR
+
+**Context.** S0's ingest posts an ``in_progress`` Check run merely to acknowledge a red build,
+before any work exists. The verdict — the route, its confidence and its evidence — must be
+visible on the commit, and, when the failure is on a pull request, in the PR thread where a
+developer is already looking. Posting to GitHub is an external call that can fail and must not
+endanger the durable result.
+
+**Decision.** After persisting the evidence and the diagnosis, ``SandboxProcessor`` posts a
+**distinct Check run named "Janus triage"** (``Settings.triage_check_name``) with ``status =
+"completed"`` and a ``conclusion`` from ``check_conclusion`` (``CODE_BUG`` →
+``action_required``; ``FLAKY`` / ``ENV`` / ``UNSURE`` → ``neutral``), whose output is
+``render_check_output``. When the run belongs to a pull request (``runs.pr_number`` is set) and
+``comment_on_pr`` is on, it also posts an issue comment with ``render_evidence``.
+``runs.pr_number`` is captured at ingest from ``workflow_run.pull_requests[0].number``
+(``set_run_pr_number``); a missing or malformed field yields ``None`` rather than failing
+ingest. Posting is **best-effort** — a failure is logged and never fails the job (the verdict is
+already persisted), and the post step is separate from the persist step.
+
+**Alternatives.** Update the ingest acknowledgement Check run in place — couples ingress to the
+brain, and the acknowledgement is posted before the job is even claimed. Post only a comment — a
+Check run is the surface that attaches to a commit regardless of a PR. Fail the job when a post
+fails — retries a job whose verdict is already durable and can double-post.
+
+**Consequences.** (+) The verdict is attached to the commit and, for a PR, mirrored into the
+thread; the acknowledgement and the verdict stay separate surfaces. (+) A GitHub outage cannot
+lose the verdict, which lives in ``diagnoses`` / ``signals`` / ``reproductions``. (−) Until the
+output-idempotency marker (``FUTURE.md`` §D) exists, an at-least-once retry that crashes between
+post and commit can duplicate the Check run/comment. *Reversible:* yes.
+
+### D-069 — `.janus.yml` is per-repo config parsed without a new dependency
+
+**Context.** Per-repository behaviour (comment vs PR, K, ``tau``/``epsilon``, cost caps,
+setup/test commands) is committed alongside the code, so it must be readable from an untrusted
+repository checkout and must not pull a heavy dependency into the worker for a handful of keys.
+
+**Decision.** ``janus/config/janus_yml.py`` defines ``RepoConfig`` (frozen; every field optional,
+``None`` meaning "fall back to the process-wide setting") and
+``parse_repo_config``/``load_repo_config``. Parsing is dependency-light and ordered: **PyYAML
+when it is importable**, else **JSON** (a valid YAML subset), else a small documented parser that
+handles exactly the forms this file uses — top-level ``key: value`` scalars, block lists, inline
+lists, and ``#`` comments. A **missing** file yields defaults; a **malformed** file raises
+``RepoConfigError`` (the caller logs and uses the defaults) rather than silently reverting to
+defaults, so a misconfiguration is visible. Validation rejects an unknown ``mode``, a
+non-integer ``k_reruns``, a ``tau``/``epsilon`` outside ``[0, 1]``, and a non-positive cap. The
+file **must not carry secrets** — it is read as untrusted repository content; tokens live only
+in the process environment. Unknown keys are preserved in ``raw`` for forward compatibility.
+
+**Alternatives.** Add PyYAML as a hard dependency — a whole parser for a handful of keys. Fall
+back to defaults silently on a parse error — hides a broken config. Allow secrets in the file — a
+committed token is a leak. Vendor a full YAML parser — more surface than the schema needs.
+
+**Consequences.** (+) No new dependency, and the same parser works with or without PyYAML
+installed. (+) A malformed file fails loud; a missing one is simply defaults. (−) The no-PyYAML
+fallback supports only a documented subset, so an exotic ``.janus.yml`` (anchors, nested maps)
+needs PyYAML present. *Reversible:* yes.
+
+### D-070 — `git bisect` is deferred; SBFL is the localizer
+
+**Context.** S2 must name the change that introduced a ``CODE_BUG``. The obvious tool is ``git
+bisect`` in the sandbox, but ``git bisect`` needs commit history, and the source provider
+(D-063) fetches the checkout with ``git fetch --depth 1``, so a cloned repository has a single
+commit and no ancestry to bisect. The Python adapter already produces per-test coverage from one
+run (D-062), which is the input SBFL needs.
+
+**Decision.** SBFL (Ochiai/DStar over the per-test coverage contexts) is the localizer. ``git
+bisect`` is **deferred**: ``Settings.bisect_enabled`` defaults to ``false``, and the deferred
+work is recorded in ``docs/FUTURE.md``. ``suspects.introducing_commit`` exists in the schema (the
+Phase 4–6 migration) and stays nullable until a history-aware localizer fills it.
+
+**Alternatives.** Unshallow the clone (``git fetch --unshallow``) — multiplies clone time and
+disk for every job and re-couples the source provider to a specific localizer. Fetch full history
+only for ``CODE_BUG`` jobs — a second fetch path and more sandbox time; deferred with the
+feature. Keep bisect on a shallow clone — bisect on a one-commit history cannot work.
+
+**Consequences.** (+) The localizer works on the checkout the pipeline already produces, with no
+extra fetch. (+) The deferred item is explicit rather than a silent gap. (−) Until bisect lands,
+Janus can rank ``file:line`` suspects but cannot name the introducing commit, so
+``introducing_commit`` stays ``NULL``. *Reversible:* yes (flip ``bisect_enabled`` and add the
+fetch).

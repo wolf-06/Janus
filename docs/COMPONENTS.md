@@ -6,7 +6,8 @@ the reasoning behind individual choices see [`DECISIONS.md`](DECISIONS.md). This
 is the "working manual": it explains behaviour, not just structure.
 
 Scope: **S0 (spine) + Phase 2 (orchestration) + Phase 3 (the sandbox, the adapter protocol and
-the Python adapter)**. The reproducer, the triage brain and the fix surfaces are still stubs.
+the Python adapter) + Phase 4 / S1 (reproduce + triage)**. The S2 fix loop and the backend
+D4–D6 work are still deferred.
 
 ---
 
@@ -252,10 +253,10 @@ milestones. The triage brain plugs in at S1/S2 without touching the loop.
 
 ## 6. `janus/report` — surfaces
 
-`check_run.start_check_run` posts an `in_progress` Check run acknowledging a red build. It
-is the only external claim S0 makes, and it proves the webhook → Check path before any
-triage exists. Later phases replace the summary with real evidence and add comment/PR
-surfaces.
+`check_run.start_check_run` posts an `in_progress` Check run acknowledging a red build. It is
+the acknowledgement the ingress makes before any work exists. The **triage verdict** is a
+separate, later surface: `comment.py` renders the evidence (see §9). PR mode
+(`report/pr.py`) is S2.
 
 ---
 
@@ -403,7 +404,109 @@ failing suite is the expected input, so only an infrastructure failure is retrya
 
 ---
 
-## 9. Cross-cutting behaviours
+## 9. `janus/core` + `janus/report` (S1) — reproduce + triage
+
+The S1 brain turns a red run into a diagnosis: rerun the failure, measure it, score seven
+signals, and render the verdict. It is built on the frozen evidence types and the adapter
+layer of §8 and adds the reproducer, the seven collectors, the scorer and the evidence
+renderer. A `CODE_BUG` decision reaches a documented no-op seam (`_maybe_fix`); the fix loop
+is S2.
+
+### `janus/core/plan.py` — adapter commands → a run plan
+Both the processor and the reproducer turn an adapter's commands into the ordered sandbox
+phases of one run, so that translation lives here once. `build_plan` emits a setup phase per
+`Adapter.setup_commands()` **only when the sandbox allows the network** (a network-less setup
+could install nothing), then the single offline test phase for the given targets (an empty
+target list means "the whole suite"). Each phase carries its command's `argv` and `artifacts`,
+so the plan is the one place a spec is materialised from; `phase_result` picks one phase's
+result out of a run.
+
+### `janus/core/reproducer.py` — the K reruns + one full-suite run
+`Reproducer.reproduce(checkout, ReproduceRequest(targets, k, profile))` measures what happens
+(D-065): it runs the failing-target set **K times** (one sandbox run per attempt), then the
+whole suite **once**, and returns a `Reproduction`. K comes from `.janus.yml`/`Settings`
+(`<= 0` clamped to 1). Each rerun is flattened to one `RunAttempt` per parsed outcome; the
+full suite is one `RunAttempt` with `target_id = None`. A sandbox-level failure (no test
+result, an `error`, or a timeout) records one failed attempt per requested target with
+`sandbox_error` set — evidence, never a raise — so the determinism signal can see the sandbox
+was unhealthy; a normal red suite is *not* a sandbox failure. `cost_minutes` sums every run's
+duration. `ambient` currently runs the same clean specs and reports `ambient_reconstructed =
+False` (CI-image reconstruction is not implemented). Blocking; a caller on the event loop runs
+it in a thread.
+
+### `janus/core/signals/**` — the seven collectors
+Each collector is a class with a `name` and `collect(ctx) -> SignalEvidence | None`, returning
+`None` to **abstain** (no evidence available) rather than voting zero. `default_collectors()`
+returns all seven in `SIGNAL_NAMES` order and `collect_all` runs them, dropping abstentions and
+logging-and-skipping a collector that raises, so one bad signal cannot break triage. Each
+`collect` reads the `SignalContext` (`reproduction`, `change`, `failing_targets`,
+`flake_history`, `metadata`):
+
+| Signal | Reads | Votes |
+|---|---|---|
+| `determinism` | the K attempts | `CODE_BUG` 0.9 when every rerun failed, `FLAKY` 0.9 when intermittent; abstains when all passed or there were no reruns. |
+| `signatures` | stdout/stderr excerpts | `ENV` 0.85 for timeout / `ECONNRESET` / 429-503 / `ENOSPC` / OOM / `SIGKILL` / DNS strings; `CODE_BUG` 0.6 for assertion-style failures; abstains when nothing matches. |
+| `exit_codes` | exit codes | `ENV` 0.8 for 137 / 124 (kill/timeout), `CODE_BUG` 0.6 for 1 / 2; abstains when nothing is classifiable. |
+| `resources` | cgroup telemetry + duration spread | `ENV` 0.9 on an OOM kill, 0.7 near the memory cap, 0.4 on an order-of-magnitude stall; else weakly `CODE_BUG` 0.3. |
+| `change_attribution` | the last-green → first-red diff | `CODE_BUG` 0.85 when a changed file is a failing test's module; `ENV` 0.4 when the diff touches nothing related; abstains with no baseline. |
+| `correlation` | `ctx.metadata` CI facts | `ENV` 0.6 for a cache miss, a retry of a failing job, a runner change, or a matrix leg that only fails there; abstains otherwise. |
+| `flake_history` | historical failure rates | `FLAKY` 0.8 at ≥ 0.30, `CODE_BUG` 0.5 when every target is ≤ 0.05; abstains in between or with no history. |
+
+Every collector's `votes` pass through `clamp_votes`, so a vote on a route outside the three
+real ones (`UNSURE`) is dropped and the rest are clamped to `[0, 1]`.
+
+### `janus/core/triage/scorer.py` — votes → scores → a route
+`aggregate` is a **weighted average over the signals that reported**: for each real route it
+divides `sum(weight × vote)` by the sum of the **present** signals' weights, so an abstaining
+collector does not dilute the score, and a signal whose name is not a weight is ignored
+(D-067). `UNSURE` is never a key of the aggregate. `score` aggregates, builds one bounded
+reason per signal (plus "no signal evidence was collected" when there is none), and delegates
+to `routes.decide`. `decide` takes the argmax over `TRIAGE_ROUTES` (ties resolve to the earlier
+route), and returns `UNSURE` when the top score is below `tau` or the top two are within
+`epsilon`; otherwise the argmax route. `confidence` is the top score, `top2_gap` the top-two
+difference.
+
+### `janus/report/comment.py` — the evidence renderer
+Pure and total, no I/O. `render_evidence` builds the Markdown comment: the route/confidence
+heading, the per-attempt table, the full-suite line, the change-attribution section (or an
+explicit "baseline could not be resolved" note), the per-signal summary/votes table, the rule's
+reasons, and a per-route "next step" line — bounded by `MAX_COMMENT_CHARS` with a truncation
+note. `render_check_output` builds the Check-run `output` (`title`/`summary`/`text`) from the
+same body minus the change section. `check_conclusion` maps a route to the Check-run
+conclusion: `CODE_BUG` → `action_required`, everything else → `neutral`.
+
+### Pipeline order in `janus/jobs/processor.py`
+`SandboxProcessor.__call__` runs the S1 pipeline for one claimed job (D-068):
+
+1. Load the repository and run rows; a missing row is a non-retryable failure.
+2. Fetch the failing run's CI log, unzip it (`janus/github/logs.py::extract_log_text`) and
+   parse the failing targets with the adapter — a fetch/parse failure degrades to "no targets".
+3. Read the per-target `flake_history` in a short-lived session.
+4. In **one** `asyncio.to_thread` (the source context is entered and exited inside it):
+   acquire the checkout, load the repo's `.janus.yml`, reproduce, resolve the last-green →
+   first-red change, build the `SignalContext`, run the collectors, and score — returning a
+   plain `_PipelineResult`.
+5. A sandbox-level failure (no full-suite result, or a `sandbox_error` on it) is a **retryable**
+   failure carrying the measured cost; a normal red suite is not.
+6. Persist the `reproductions` rows, the `signals` rows and the `diagnoses` row in one
+   transaction; a persistence failure is retryable.
+7. Post the "Janus triage" Check run, and a PR comment when `runs.pr_number` is set and
+   `comment_on_pr` is on. Posting is best-effort.
+8. A `CODE_BUG` decision reaches `_maybe_fix` — a documented no-op seam S2 fills.
+
+### `tests/fixtures/sample_repo/` — the S1 seed repository
+A tiny stdlib-only Python repo the sandbox builds and runs: one deterministic logic bug
+(`src/calc.py::sum_to` off by one → `CODE_BUG`), a driven flake (`JANUS_SAMPLE_FLAKE` chooses
+pass/fail → `FLAKY`), an ENV case (`JANUS_SAMPLE_ENDPOINT` unset → an infrastructure signature
+→ `ENV`), and an always-green control. It carries a `requirements.txt` (empty) and an example
+`.janus.yml`. Its tests are meant to fail, so `norecursedirs` in `pyproject.toml` keeps pytest
+from collecting them as part of Janus's own suite (asserted by `test_fixture_isolation.py`).
+`tests/integration/test_sample_repo.py` runs the logic bug and the control through the adapter
+in the sandbox (Docker-gated).
+
+---
+
+## 10. Cross-cutting behaviours
 
 - **Idempotency.** Webhook redeliveries are deduped by the `deliveries` PK; a job is
   one-per-delivery (`jobs.delivery_id` unique). Both are database constraints, not
@@ -422,22 +525,19 @@ failing suite is the expected input, so only an infrastructure failure is retrya
 
 ---
 
-## 10. Still stubbed / deferred
+## 11. Still stubbed / deferred
 
-The triage brain and the rest of the backend track. See [`FUTURE.md`](FUTURE.md) for the
-full ledger. In short:
+See [`FUTURE.md`](FUTURE.md) for the full ledger. In short:
 
-- **Product brain (S1):** `janus/core/**` (reproducer, signals, triage),
-  `janus/report/comment.py` and `janus/config/janus_yml.py`. The sample fixture repo
-  (`tests/fixtures/`) is deferred to Phase 4. The adapter Protocol
-  (`janus/core/adapter.py`) and the Python adapter (`janus/adapters/python/**`) are
-  **implemented**, and the sandbox is wired into `JobProcessor` via `processor_mode`.
 - **Fix loop (S2):** `janus/core/{localize,retrieve,generate,prove}`, `janus/report/pr.py`.
+  `SandboxProcessor._maybe_fix` is the seam it fills. `git bisect` is deferred — the source
+  clone is `--depth 1`, so there is no history to bisect (D-070) — and SBFL is the localizer.
+- **Benchmark harness (Phase 8):** the BugsInPy subset harness and metrics table (`bench/`).
 - **Backend D4–D6:** fairness/rate limits/budgets (`janus/jobs/{ratelimit,budgets}.py`),
   dedup, observability (`janus/observability/`), load test (`bench/`), Redis, and
   `docs/DESIGN.md`.
 - **Output idempotency marker:** `janus/report/markers.py` (needed before the brain posts
   comments/checks).
 
-The worker is wired to call the brain via `JobProcessor`; these modules are empty until
-their phases.
+The worker calls the brain via `JobProcessor`; the S1 pieces above are implemented, and these
+modules are empty until their phases.

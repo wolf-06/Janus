@@ -72,19 +72,33 @@ brain (S1/S2) plugs into the worker without changing the pipeline.
 - **Adapter interface (Phase 3):** *done* — `core/adapter.py` Protocol, the adapter
   conformance suite (`tests/conformance/`), and the Python adapter (pytest JSON report,
   coverage.py contexts, mutmut); the sandbox is wired into `JobProcessor` and selected by
-  `processor_mode` (ADR D-061…D-064). Phase 3 is now complete **except the sample fixture
-  repo**, which is deferred to Phase 4: it will hold a passing, a failing and a flaky test
-  plus a `requirements.txt`, and it must set `norecursedirs` (e.g. in
-  `[tool.pytest.ini_options]`) so pytest does not collect its tests as part of Janus's own
-  suite.
-- **Reproducer (Phase 4):** K=5 reruns of failing targets + one full-suite run; `clean`
-  and `ambient` profiles.
-- **7 signal collectors + scorer:** determinism, signatures, exit codes, resources, change
-  attribution, correlation, flake history → routes `CODE_BUG`/`FLAKY`/`ENV`/`UNSURE` with
-  `tau`/`epsilon`.
-- **Evidence comment** (`report/comment.py`) and `.janus.yml` per-repo config
-  (`config/janus_yml.py`).
-- Plugs into: `janus/jobs/worker.py` `JobProcessor` (replace `stub_processor`).
+  `processor_mode` (ADR D-061…D-064).
+- **Reproducer (Phase 4):** *done* — `janus/core/reproducer.py` reruns the failing-target
+  set K times (one sandbox run per attempt) then runs the full suite once; `clean` and
+  `ambient` profiles (ambient currently falls back to clean specs and records
+  `ambient_reconstructed = False`). See ADR D-065.
+- **7 signal collectors + scorer (Phase 4):** *done* — `janus/core/signals/`
+  (determinism, signatures, exit codes, resources, change attribution, correlation, flake
+  history) and `janus/core/triage/scorer.py` (weighted average over the **present**
+  signals) → routes `CODE_BUG`/`FLAKY`/`ENV`/`UNSURE` with `tau`/`epsilon`. See ADR
+  D-066/D-067.
+- **Evidence comment + `.janus.yml` (Phase 4):** *done* — `janus/report/comment.py`
+  (`render_evidence`, `render_check_output`, `check_conclusion`) and
+  `janus/config/janus_yml.py` (`RepoConfig`, `parse_repo_config`, `load_repo_config`). See
+  ADR D-068/D-069.
+- **Pipeline wiring (Phase 4):** *done* — `janus/jobs/processor.py` fetches the CI log,
+  parses the failing tests, checks out the revision, reproduces, resolves the change,
+  collects and scores, persists, and posts a "Janus triage" Check run (+ a PR comment when
+  the run has a PR); `_maybe_fix` is the documented S2 seam.
+- **Sample fixture repo (Phase 4):** *done* — `tests/fixtures/sample_repo/` holds a
+  deterministic logic bug, a driven flake, an ENV case and an always-green control, plus a
+  `requirements.txt` and an example `.janus.yml`; `norecursedirs` keeps pytest from
+  collecting it as part of Janus's own suite.
+- **`git bisect` (Phase 5 / S2):** *deferred* — `Settings.bisect_enabled` defaults to
+  `false`. The source provider clones with `git fetch --depth 1`, so the checkout has no
+  history to bisect; SBFL over the per-test coverage contexts is the localizer. See ADR
+  D-070.
+- Plugs into: `janus/jobs/worker.py` `JobProcessor` (replaces `stub_processor`).
 
 ## C. Fix loop (S2) — localize, retrieve, generate, prove, PR
 

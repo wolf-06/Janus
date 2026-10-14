@@ -254,8 +254,7 @@ attempt), per-repo daily sandbox/LLM budgets → `skipped_budget` + comment.
 bound; a 429 storm causes zero lost jobs.
 
 ### Phase 3 — Sandbox runner + adapter interface
-**Status:** **done** apart from the **sample fixture repo**, which is deferred to Phase 4. The
-sandbox core is complete — TOML-configured settings, `SandboxSpec`/`SandboxResult`, a fresh per-run
+**Status:** **done**. The sandbox core is complete — TOML-configured settings, `SandboxSpec`/`SandboxResult`, a fresh per-run
 image build (repo Dockerfile or Janus-generated; content-addressed, removed afterwards; ADR D-056),
 two-phase `RunPlan`, streamed and bounded output (D-058), rootless support via
 `docker_host`/`require_rootless` (D-057), an enforced host allowlist via an internal network plus an
@@ -264,7 +263,8 @@ container paths read back before removal; ADR D-060) (`janus/sandbox/*`); see
 `docs/specs/SANDBOX.md`. The **adapter layer** is implemented too: the `core/adapter.py` Protocol +
 conformance suite, the **Python adapter** (pytest, coverage.py contexts, mutmut), and the
 **`JobProcessor` wiring** (`SandboxProcessor`, built by `build_processor`, selected by
-`processor_mode`; ADR D-061…D-064); see `docs/specs/ADAPTER.md`.
+`processor_mode`; ADR D-061…D-064); see `docs/specs/ADAPTER.md`. The **sample fixture repo** that
+was deferred from this phase landed in Phase 4 (`tests/fixtures/sample_repo/`).
 **Build:** ephemeral container runner that builds a fresh per-run image (repo Dockerfile or
 Janus-generated, content-addressed, removed afterwards), streams and bounds command output,
 supports rootless Docker via `docker_host`/`require_rootless`, and enforces the host allowlist
@@ -277,6 +277,17 @@ results + telemetry; redaction unit tests (secrets/`.env`/high-entropy); caps en
 adapter conformance test suite passes for the Python adapter.
 
 ### Phase 4 — S1 Reproduce + Triage
+**Status:** **done** (S1). Shipped: the reproducer (`janus/core/reproducer.py` — K reruns of
+the failing-target set plus one full-suite run; ADR D-065); the frozen evidence types
+(`janus/core/evidence.py`) and the decision rule (`janus/core/triage/routes.py`; ADR D-066);
+the seven signal collectors (`janus/core/signals/**`) and the scorer
+(`janus/core/triage/scorer.py`; ADR D-067); the evidence renderer (`janus/report/comment.py`);
+the full pipeline in `janus/jobs/processor.py` (fetch log → parse failing tests → checkout →
+reproduce → resolve change → collect signals → score → persist → post a "Janus triage" Check
+run, plus a PR comment when the run has a PR; ADR D-068); the `.janus.yml` loader
+(`janus/config/janus_yml.py`; ADR D-069); and the S1 seed repo
+(`tests/fixtures/sample_repo/`). `_maybe_fix` is the documented S2 entry point. The
+confusion-matrix harness over a wider seed set lands with the Phase 8 benchmark.
 **Build:** reproducer (K=5 reruns of failing targets, full suite once at end; clean +
 ambient profiles); the 7 signal collectors; scoring engine with configurable weights,
 `tau`, `epsilon`, argmax/UNSURE logic; evidence comment rendering; pipeline wiring

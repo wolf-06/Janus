@@ -19,11 +19,13 @@ a Postgres-as-queue with leases/heartbeat/reaper, retries with full jitter, dead
 with admin requeue, cost caps, quotas and a kill switch. The **sandbox core** (Phase 3) is
 built too: TOML-configured, two-phase container runs with `docker cp`, resource limits,
 telemetry and secret redaction. The **adapter layer** is built: the `Adapter` protocol, its
-conformance suite and the Python adapter. The triage brain (reproduce, classify, fix, PR) is
-stubbed and tracked in [`docs/FUTURE.md`](docs/FUTURE.md). Backend spec:
-[`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
+conformance suite and the Python adapter. **S1 (Phase 4) is implemented**: the reproducer,
+the seven signal collectors, the scorer and the evidence surface (see below). The **fix loop
+and PR mode (S2)** are still stubbed and tracked in [`docs/FUTURE.md`](docs/FUTURE.md).
+Backend spec: [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
 [`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md); adapter spec:
-[`docs/specs/ADAPTER.md`](docs/specs/ADAPTER.md).
+[`docs/specs/ADAPTER.md`](docs/specs/ADAPTER.md); triage spec:
+[`docs/specs/S1.md`](docs/specs/S1.md).
 
 ## Requirements
 
@@ -65,7 +67,8 @@ curl -s localhost:8000/admin/dead
 curl -s -X POST localhost:8000/admin/jobs/<id>/requeue
 ```
 
-The processor is a no-op stub by default; the reproduce/triage/fix brain plugs in at S1/S2
+The processor is a no-op stub by default; set `processor_mode = "sandbox"` to run the S1
+reproduce-and-triage brain (see below). The S2 fix loop is still stubbed
 (see `docs/FUTURE.md`).
 
 ## Adapter and processor
@@ -79,8 +82,31 @@ under `/var/tmp/janus`.
 
 By default the worker runs the no-op `stub` processor. Set `processor_mode = "sandbox"` (in
 `janus.toml`, or `JANUS_PROCESSOR_MODE=sandbox`) to make the worker run real work in a container:
-acquire the source, run the adapter's commands, parse the outcomes. It gathers evidence only —
-triage arrives in Phase 4.
+acquire the source, run the adapter's commands, parse the outcomes.
+
+## Reproduce and triage
+
+With `processor_mode = "sandbox"`, a claimed job runs the S1 pipeline:
+
+1. **Reproduce.** Rerun the failing targets **K times** (`k_reruns`, default 5) in the sandbox,
+   then run the **full suite once** at the end. K reruns of the failing-target *set* (not per
+   test) separate a deterministic failure from an intermittent one at a predictable cost. A
+   sandbox-level failure is recorded as evidence, not raised.
+2. **Score seven signals.** `determinism`, `signatures`, `exit_codes`, `resources`,
+   `change_attribution`, `correlation` and `flake_history`, each voting support in `[0, 1]` for
+   the three real routes. A signal with no evidence **abstains**; the scorer averages the votes
+   by weight over the signals that reported, so a missing signal does not dilute the score.
+3. **Decide.** The argmax route wins only if its score is `>= tau` (default `0.80`) **and** it
+   leads the runner-up by more than `epsilon` (default `0.05`); otherwise the verdict is
+   `UNSURE`. The routes are `CODE_BUG`, `FLAKY`, `ENV` and `UNSURE`.
+4. **Report.** The verdict is posted as a **"Janus triage" Check run**, and — when the run
+   belongs to a pull request — an evidence comment. Only **`CODE_BUG`** would proceed to a fix;
+   **`FLAKY`, `ENV` and `UNSURE` are comment-only**. The fix loop is S2, so a `CODE_BUG` verdict
+   currently stops at the `_maybe_fix` seam.
+
+Thresholds (`k_reruns`, `tau`, `epsilon`, caps) come from the environment or `janus.toml`, and a
+repository can override them in a committed `.janus.yml`. The S1 seed repo lives at
+`tests/fixtures/sample_repo/` (a logic bug, a driven flake, an ENV case and a control).
 
 ## Sandbox configuration
 
