@@ -35,6 +35,9 @@ max_suspects = 5
 max_fix_attempts = 3
 # Run `git bisect` in the sandbox to find the introducing commit.
 bisect_enabled = false
+# Escape hatch: false reports the mutation gate as passed with measured_value="disabled"
+# (shown in the PR body/comment) instead of running mutmut twice per attempt.
+mutation_gate_enabled = true
 
 # --- LLM (used by S2 diff generation) ---
 # OpenAI-compatible endpoint; unset uses the client default.
