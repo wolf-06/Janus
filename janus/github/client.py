@@ -125,6 +125,27 @@ class GitHubClient:
             payload["output"] = output
         return _as_dict(self._request("POST", f"/repos/{owner}/{repo}/check-runs", json=payload))
 
+    def create_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+        draft: bool = True,
+    ) -> dict[str, Any]:
+        """Open a pull request; drafts are the default and merging is not supported."""
+        payload: dict[str, Any] = {
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body,
+            "draft": draft,
+        }
+        return _as_dict(self._request("POST", f"/repos/{owner}/{repo}/pulls", json=payload))
+
     def create_issue_comment(
         self, owner: str, repo: str, issue_number: int, body: str
     ) -> dict[str, Any]:
