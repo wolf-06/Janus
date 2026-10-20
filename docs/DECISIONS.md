@@ -1278,3 +1278,185 @@ extra fetch. (+) The deferred item is explicit rather than a silent gap. (−) U
 Janus can rank ``file:line`` suspects but cannot name the introducing commit, so
 ``introducing_commit`` stays ``NULL``. *Reversible:* yes (flip ``bisect_enabled`` and add the
 fetch).
+
+### D-071 — SBFL over per-test coverage, Ochiai by default
+
+**Context.** The fix loop needs to name the source lines worth changing. The adapter's
+coverage run already records which lines each test executed (D-062). Using file-level
+coverage would only say that some test touched a file; it cannot recover which *failing*
+tests covered a line, so the classic SBFL counters — ``ef`` (failing tests covering the
+line) and ``ep`` (passing tests covering it) — are not computable. The choice of formula
+and of which lines count as suspects is therefore part of the localizer's contract.
+
+**Decision.** ``janus/core/localize/sbfl.py::localize`` consumes one ``CoverageContext`` per
+test and treats a context whose ``test_id`` is in the failing set as failing, every other
+context as passing. It computes ``ef`` / ``ep`` / ``nf`` / ``np`` per ``(file, line)`` and
+ranks with **Ochiai** by default: ``ef / sqrt((ef + nf) * (ef + ep))``. **DStar**
+(exponent ``*`` = 2) is available as ``SbflFormula.DSTAR``. A line with **``ef == 0``** is
+covered only by passing tests and is **not a suspect**, so it is omitted even when its
+formula score is defined. Degenerate denominators score ``0.0``; duplicate contexts and
+repeated pairs count once; the result is capped at ``max_suspects`` (default 5) with ties
+broken by ``file`` then ``line``.
+
+**Alternatives.** File-level coverage — cannot distinguish failing from passing coverage,
+so no SBFL formula applies. DStar as the default — more sensitive to a single failing test
+and less stable on small spectra; kept as an option rather than the default. Include
+``ef == 0`` lines with score 0 — they can never outrank a covered-by-a-failure line and
+would only pad the suspect list with innocent code. A learned ranker — no training data in
+S2.
+
+**Consequences.** (+) Suspects are grounded in the failing tests themselves, not in a
+heuristic over changed files. (+) Ochiai's bounded ``[0, 1]`` score is easy to display and
+to reason about. (+) Deferring DStar to an explicit enum keeps the default deterministic.
+(−) SBFL needs per-test coverage, which is slower than a single file-level run; that cost is
+already paid by the adapter and shared with S1 evidence. *Reversible:* yes (pass a
+different ``SbflFormula``).
+
+### D-072 — Retrieval is git-log grep, not a vector index
+
+**Context.** ``PLAN.md`` §1.3 asks the generator to learn from past fixes with a grep of
+``git log -p`` and explicitly rejects a vector database for v1 (§2: "Vector DB / RAG →
+``git log -p`` grep; good enough for v1"). A repository's own history is already on disk in
+the checkout, needs no ingestion pipeline, and cannot leak code to an embedding provider.
+
+**Decision.** ``janus/core/retrieve/git_grep.py`` is the whole retriever. ``build_terms``
+turns failing test ids, suspect basenames and error-line tokens into a small ordered,
+case-insensitively de-duplicated set, dropping timestamps, paths, line numbers, addresses
+and hashes. ``git_log_argv`` builds a shell-free `git log --oneline -p --max-count=50
+-G<term>` argv (one predicate per term, regex-escaped); ``parse_git_log`` parses commits
+into ``PriorFix`` rows with a bounded diff excerpt; ``rank`` scores by the number of
+distinct matching terms. The processor keeps the top five and the prompt uses at most
+three. There are **no embeddings** and no index.
+
+**Alternatives.** A vector index over commits — a new store, an embedding dependency, a
+leak surface, and an ingestion job for a corpus that is usually shallow. Feeding the whole
+log into the prompt — unbounded and mostly irrelevant. Grepping only the current source —
+misses the historical fix that shows the intended change shape.
+
+**Consequences.** (+) Zero new infrastructure; retrieval works offline in the checkout.
+(+) Deterministic terms make the prompt and its tests reproducible. (−) ``-G`` matches text,
+not meaning, so a fix described with different vocabulary is missed; a semantic retriever
+can replace this later without changing the processor's interface. *Reversible:* yes.
+
+### D-073 — Generation goes through an OpenAI-compatible HTTP client with a NullLLM fallback
+
+**Context.** The generator needs one text completion per attempt and must not marry the
+pipeline to a vendor SDK, a browser login or a particular hosted product. CI and tests must
+run with no key at all, and the key is a secret that must never leak into logs, argv or a
+URL.
+
+**Decision.** ``janus/core/generate/llm.py`` defines the minimal ``LLMClient`` protocol
+(``available`` and ``complete``). ``OpenAICompatibleClient`` calls
+``POST {base_url}/chat/completions`` over ``httpx`` with an injectable transport;
+``temperature=0.0`` and a bounded ``max_tokens``. The API key travels **only** as a
+``Bearer`` header — never in the URL, never in an error message, never logged. ``build_llm``
+requires **both** ``llm_api_key`` and ``llm_base_url``; with either missing it returns
+``NullLLM`` (``available = False``). In that case the loop stops at ``status="no_llm"``
+with its suspects and prior fixes, and ``_post_fix`` degrades to the suggest comment rather
+than inventing a diff.
+
+**Alternatives.** A vendor SDK — a heavy dependency for one endpoint and a moving API
+surface. Make the key optional and call a default endpoint — an implicit network call and
+an ambiguous failure mode. Raise when unconfigured — turns a deployment choice into a
+failed job. Log the request for debugging — would leak the key and repository source.
+
+**Consequences.** (+) Any OpenAI-compatible endpoint works, including a local one. (+)
+Tests use ``httpx.MockTransport`` and need no network or key. (+) An unconfigured
+deployment degrades visibly and safely. (−) The client implements only the chat-completions
+shape, so a provider with a different protocol needs an adapter. *Reversible:* yes.
+
+### D-074 — The four proof gates fail closed; mutation is opt-out but visibly disabled
+
+**Context.** A generated patch is a claim that the suite is green, mutation and coverage did
+not regress, and no test file changed. Measurements can be absent for mundane reasons (the
+sandbox failed, a tool wrote no artifact, coverage produced no contexts). Treating absence
+as success would let an unmeasured diff become a PR, which is exactly the "no claim without
+a gate" guardrail (``PLAN.md`` §4). Mutation is also by far the most expensive gate, so an
+escape hatch is needed for development.
+
+**Decision.** ``janus/core/prove/gates.py::evaluate`` always returns exactly four
+``GateResult``s in a stable order: ``suite_green``, ``mutation_non_regression``,
+``coverage_non_regression``, ``test_files_unchanged``. The suite gate tracks the boolean;
+mutation passes only when killed mutants **and** the mutant total are non-decreasing;
+coverage passes when ``after >= before - 1e-9``; the test-hash gate compares the SHA-256
+map of ``test_*.py`` / ``*_test.py`` under ``tests/``. A **missing** suite result, mutation
+measurement or coverage value **fails closed** (``measured_value="unavailable"``), and
+``all_passed`` requires at least one result and every result to pass. The only opt-out is
+``mutation_gate_enabled = false``: the processor skips ``mutmut`` and rewrites that row to
+``passed=True``, ``measured_value="disabled"``, ``baseline_value=None``, so the PR body and
+comment show the gate as **disabled**, not as measured. The setting defaults to enabled.
+
+**Alternatives.** Treat a missing measurement as a pass — an unmeasured claim becomes a PR.
+Skip the mutation gate silently when it errors — indistinguishable from a real
+non-regression. Remove mutation entirely — loses the strongest signal against a
+test-shaped patch. Run mutation always — doubles sandbox time per attempt with no opt-out
+for local work.
+
+**Consequences.** (+) Every PR's verification table maps to a measurement or an explicit
+``disabled``/``unavailable`` state. (+) A broken tool can only block a fix, never wave one
+through. (−) A flaky or misconfigured coverage/mutation command fails the fix even when the
+patch is correct; the operator must fix the measurement. *Reversible:* yes (flip
+``mutation_gate_enabled``).
+
+### D-075 — A static policy gate rejects cheating diffs
+
+**Context.** The measured gates answer "did the numbers hold?", not "did the patch cheat?".
+A diff can keep the suite green by editing the test, adding ``|| true``, skipping the
+failing case or lowering a coverage threshold. Those shapes are cheap to detect from the
+diff text, before spending time on a sandbox run, and they must never reach a PR.
+
+**Decision.** ``janus/core/prove/policy.py::check_policy`` parses the unified diff and
+emits deterministic ``PolicyViolation``s, in a fixed rule order:
+``edits_tests`` (a touched path looks like a test or is in the supplied test-file set),
+``edits_protected`` (a path in ``protected_files``, e.g. CI or coverage config),
+``weakens_ci`` (an added ``continue-on-error``, ``|| true`` or ``set +e``),
+``skips_tests`` (an added skip/xfail marker across pytest, unittest, Jest/Vitest, Go and
+JUnit), ``lowers_threshold`` (an added coverage threshold below one the diff removes),
+``removes_assertions`` (a removed ``assert`` with no corresponding added one) and
+``weakens_tests`` (more deleted than added test lines). It is **static**: no tests, mutators
+or coverage tools run. The processor checks it before applying a diff; a violation is fed
+back to the next attempt, and a diff that only ever violates the policy ends as
+``rejected`` with **no PR**. Violations are rendered on the suggest surface but are not
+persisted in ``gate_results`` (that table is for measured gates).
+
+**Alternatives.** Rely on the four measured gates — a test edit that keeps coverage and
+mutation flat can still pass them. Use an LLM to judge the diff — nondeterministic, and the
+cheater is the same model. Add a new sandbox tool — more surface and more time for a
+text-only check. Reject any diff touching a test — the policy already does that; the other
+rules cover non-test cheating.
+
+**Consequences.** (+) Known cheating shapes are refused cheaply and before any measurement
+is trusted. (+) Stable rule ids make the feedback and the tests precise. (−) A legitimate
+change that touches a test file (for example fixing a genuinely wrong test) is refused; S2
+is source-only by design. (−) A novel cheating shape not in the rule set still depends on
+the measured gates. *Reversible:* yes.
+
+### D-076 — PR mode is draft-only and never merges or force-pushes
+
+**Context.** Janus writes to a user's repository. The product guardrail is "PR-only: no
+auto-merge, never force-push" (``PLAN.md`` §4), and a generated fix is unproven until a
+human reviews it, however many gates passed. The default must be the least destructive
+surface, and a failed push must not lose the analysis.
+
+**Decision.** ``fix_mode`` defaults to **``suggest``**: the outcome is a comment on the PR,
+or a neutral fix Check run when the run has no PR. A repository's ``.janus.yml`` may set
+``mode: pr``; then only a **proven** fix is pushed to ``janus/fix-<job_id>`` (a normal
+branch, no ``--force``) and opened as a **draft** PR via
+``GitHubClient.create_pull_request(..., draft=True)``. There is no merge, approve or
+force-push method in the client or the push helper, and tests assert the push argv contains
+no force flag. Installation tokens travel only in the child git environment as an
+``http.extraHeader`` (D-063), never in a URL or argv. A push or PR failure is logged and
+falls back to the suggest comment. The PR body and suggest comment include the guardrail
+line that Janus never merges and never force-pushes.
+
+**Alternatives.** Open a ready-for-review PR — invites merging an unreviewed machine patch.
+Auto-merge on all gates green — no human in the loop and no defence against a gate blind
+spot. Force-push to keep the branch name stable across retries — destroys user work and is
+explicitly forbidden. Make ``pr`` the default — the more destructive surface should be
+opt-in.
+
+**Consequences.** (+) The default cannot write a branch or open a PR. (+) Even in ``pr``
+mode a human must mark the draft ready and merge it. (+) A push failure still yields the
+analysis as a comment. (−) A proven fix needs one extra human action (mark ready) before it
+can land. *Reversible:* yes (change the default), but the merge/force-push omission is
+intentional.

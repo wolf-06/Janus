@@ -286,8 +286,8 @@ the full pipeline in `janus/jobs/processor.py` (fetch log → parse failing test
 reproduce → resolve change → collect signals → score → persist → post a "Janus triage" Check
 run, plus a PR comment when the run has a PR; ADR D-068); the `.janus.yml` loader
 (`janus/config/janus_yml.py`; ADR D-069); and the S1 seed repo
-(`tests/fixtures/sample_repo/`). `_maybe_fix` is the documented S2 entry point. The
-confusion-matrix harness over a wider seed set lands with the Phase 8 benchmark.
+(`tests/fixtures/sample_repo/`). A `CODE_BUG` verdict continues into the Phase 5–7 fix
+loop. The confusion-matrix harness over a wider seed set lands with the Phase 8 benchmark.
 **Build:** reproducer (K=5 reruns of failing targets, full suite once at end; clean +
 ambient profiles); the 7 signal collectors; scoring engine with configurable weights,
 `tau`, `epsilon`, argmax/UNSURE logic; evidence comment rendering; pipeline wiring
@@ -308,6 +308,9 @@ Unique partial index on `(fingerprint) WHERE state IN ('queued','running')`; tra
 not merged (false-merge rate measured on the BugsInPy subset).
 
 ### Phase 5 — S2 Localize + Retrieve + Generate
+**Status:** **done** — SBFL ranks `file:line` from per-test coverage, `git log -p` retrieval
+feeds an OpenAI-compatible diff generator, and generation retries with gate feedback inside
+the processor; `git bisect` is deferred (D-070).
 **Build:** SBFL (Ochiai/DStar) over per-test coverage contexts → ranked `file:line`;
 sandbox `git bisect` for the introducing commit; retrieval via `git log -p` grep on
 fault signature (error type, location, change shape); LLM generation of a minimal
@@ -316,6 +319,8 @@ source-only unified diff (1 attempt/suspect, ≤3 retries with verifier feedback
 identifies the introducing commit; generated diffs apply cleanly and never touch tests.
 
 ### Phase 6 — S2 Proof + Policy gates
+**Status:** **done** — the four measured gates fail closed, the static policy gate rejects
+cheating diffs, retries use gate feedback, and a failed proof falls back to a comment.
 **Build:** Gate 1 full suite green; Gate 2 mutation non-regression (`mutmut`, targeted
 to changed lines); Gate 3 coverage non-regression; Gate 4 test-file hash lock; policy
 gate (reject test edits, `continue-on-error`, `|| true`, `set +e`, unexplained
@@ -326,6 +331,8 @@ diffs; false-fix rate ≈ 0 on the sample set; failed proof after retries falls 
 comment.
 
 ### Phase 7 — S2 PR mode + surfaces
+**Status:** **done** — suggest is the default; `pr` mode opens a draft PR with the
+verification table and has no merge or force-push path.
 **Build:** `.janus.yml` `mode: pr|suggest` (**default suggest**); PR creation with
 diagnosis, root cause, diff, and verification table; PR-only, no auto-merge, no
 force-push; comment rendering parity with PR body.

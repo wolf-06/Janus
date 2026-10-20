@@ -6,8 +6,9 @@ the reasoning behind individual choices see [`DECISIONS.md`](DECISIONS.md). This
 is the "working manual": it explains behaviour, not just structure.
 
 Scope: **S0 (spine) + Phase 2 (orchestration) + Phase 3 (the sandbox, the adapter protocol and
-the Python adapter) + Phase 4 / S1 (reproduce + triage)**. The S2 fix loop and the backend
-D4–D6 work are still deferred.
+the Python adapter) + Phase 4 / S1 (reproduce + triage) + Phases 5–7 / S2 (the CODE_BUG fix
+loop and its surfaces)**. The benchmark harness, `git bisect`, the output-idempotency marker
+and the backend D4–D6 work are still deferred.
 
 ---
 
@@ -204,7 +205,8 @@ Four mechanisms answering one question — *"may this job keep going?"*:
 - **`backoff_seconds`** gives **full-jitter** retry spacing:
   `rand(0, min(cap, base·2^attempts))`.
 
-`max_fix_retries` is carried here for the S2 fix loop.
+`max_fix_retries` is carried here for future fix-retry accounting; the S2 loop is bounded
+by `max_fix_attempts` instead.
 
 ### `queue.py` — the Postgres queue
 - `enqueue(session, delivery_id, repo_id, run_id, ...)` dedupes on `delivery_id` (one job
@@ -255,8 +257,8 @@ milestones. The triage brain plugs in at S1/S2 without touching the loop.
 
 `check_run.start_check_run` posts an `in_progress` Check run acknowledging a red build. It is
 the acknowledgement the ingress makes before any work exists. The **triage verdict** is a
-separate, later surface: `comment.py` renders the evidence (see §9). PR mode
-(`report/pr.py`) is S2.
+separate, later surface: `comment.py` renders the evidence (see §9). `pr.py` renders the S2
+suggest comment and draft-PR body from the same measured facts (see §10).
 
 ---
 
@@ -409,8 +411,8 @@ failing suite is the expected input, so only an infrastructure failure is retrya
 The S1 brain turns a red run into a diagnosis: rerun the failure, measure it, score seven
 signals, and render the verdict. It is built on the frozen evidence types and the adapter
 layer of §8 and adds the reproducer, the seven collectors, the scorer and the evidence
-renderer. A `CODE_BUG` decision reaches a documented no-op seam (`_maybe_fix`); the fix loop
-is S2.
+renderer. A `CODE_BUG` decision proceeds to the S2 fix loop (§10); `FLAKY`, `ENV` and
+`UNSURE` stop at the verdict.
 
 ### `janus/core/plan.py` — adapter commands → a run plan
 Both the processor and the reproducer turn an adapter's commands into the ordered sandbox
@@ -492,7 +494,8 @@ conclusion: `CODE_BUG` → `action_required`, everything else → `neutral`.
    transaction; a persistence failure is retryable.
 7. Post the "Janus triage" Check run, and a PR comment when `runs.pr_number` is set and
    `comment_on_pr` is on. Posting is best-effort.
-8. A `CODE_BUG` decision reaches `_maybe_fix` — a documented no-op seam S2 fills.
+8. A `CODE_BUG` decision runs the S2 fix loop (§10) inside the same source context; its
+   outcome is persisted and surfaced after the triage post.
 
 ### `tests/fixtures/sample_repo/` — the S1 seed repository
 A tiny stdlib-only Python repo the sandbox builds and runs: one deterministic logic bug
@@ -506,7 +509,119 @@ in the sandbox (Docker-gated).
 
 ---
 
-## 10. Cross-cutting behaviours
+## 10. `janus/core` + `janus/report` (S2) — the CODE_BUG fix loop
+
+S2 turns a `CODE_BUG` diagnosis into a source-only diff and tries to prove it. Only
+`CODE_BUG` enters: `FLAKY`, `ENV` and `UNSURE` are comment-only per S1. The loop runs
+**inside the source context**, in the same `asyncio.to_thread` block as reproduction, since
+every step needs the checkout on disk. The spec is [`specs/S2.md`](specs/S2.md); the ADRs are
+D-071…D-076.
+
+### `janus/core/localize/` — SBFL (and a deferred bisect planner)
+`sbfl.py::localize(contexts, failing_test_ids, formula=OCHIAI, max_suspects=5)` ranks
+`file:line` suspects from **per-test** coverage. A context whose `test_id` is failing
+contributes `ef`; every other contributes `ep`; `nf`/`np` are the totals minus coverage.
+Ochiai is the default (`ef / sqrt((ef + nf) * (ef + ep))`), DStar is an option. A line with
+`ef == 0` is not a suspect, duplicate contexts count once, ties break by file then line, and
+the list is capped. `bisect.py` is a **pure** planner/parser (`plan_bisect`,
+`parse_bisect_output`, `available`); it executes nothing, and `bisect_enabled` is off
+because the checkout has `--depth 1` (D-070). `introducing_commit` therefore stays `NULL`.
+
+### `janus/core/retrieve/git_grep.py` — git-log retrieval
+No vector index (D-072). `build_terms` turns failing test ids, suspect basenames and
+error-line tokens into a small deterministic term set, dropping timestamps, paths, line
+numbers and hashes. `git_log_argv` builds a shell-free `git log --oneline -p
+--max-count=50 -G<term>` argv; `parse_git_log` yields `PriorFix` rows with a bounded diff
+excerpt; `rank` scores by distinct matching terms. The processor keeps the top five and the
+prompt at most three. A git failure degrades to no prior fixes.
+
+### `janus/core/generate/` — prompt and LLM
+`prompt.py::build_fix_prompt` assembles diagnosis, failure excerpts, suspects, relevant
+source, prior fixes and the hard rules, capped at 24,000 characters with source truncated
+first. `extract_diff` accepts a fenced diff or a bare unified diff and returns `None` for
+prose. `llm.py` defines the `LLMClient` protocol, `NullLLM` and
+`OpenAICompatibleClient` (`POST {base_url}/chat/completions`). The key is a `Bearer` header
+only — never in a URL, argv, error or log (D-073). `build_llm` needs both `llm_api_key` and
+`llm_base_url`; otherwise the loop returns `no_llm` and the result degrades to a comment.
+
+### `janus/core/prove/` — policy and the four gates
+`policy.py::check_policy` is the **static** gate: it rejects test/protected-file edits,
+`continue-on-error` / `|| true` / `set +e`, skip/xfail markers, lowered coverage thresholds,
+removed assertions and net test-line deletion (D-075). `gates.py::evaluate` always returns
+four `GateResult`s: `suite_green`, `mutation_non_regression`, `coverage_non_regression`,
+`test_files_unchanged`. A missing suite/mutation/coverage measurement **fails closed**;
+`all_passed` requires at least one result and every result to pass. With
+`mutation_gate_enabled = false`, the mutation row is `passed=True` with
+`measured_value="disabled"` so it is visibly disabled (D-074).
+
+### `janus/report/pr.py` — the surfaces
+Pure renderers: `render_pr_body` (diagnosis, reproduction, change, root cause/suspects,
+diff, four-gate verification table, policy result, guardrail), `render_suggest_comment`
+(the same facts plus an explicit "why no PR" for suggest mode or a failed proof),
+`render_pr_title` and `branch_name` (`janus/fix-<job_id>`). Both documents are bounded at
+20,000 characters.
+
+### `janus/github/push.py` — commit and push
+`commit_and_push` runs `checkout -B`, `add -A`, `commit`, `push` with a bounded timeout. The
+installation token is passed only through `GIT_CONFIG_*` in the child environment; it never
+appears in argv, a remote URL or an error. Unsafe branch names are rejected. There is no
+force flag.
+
+### Exact order inside `SandboxProcessor._run_fix`
+Called only for `Route.CODE_BUG`, with the checkout, targets, reproduction, decision and
+repo config:
+
+1. Run the adapter's coverage command on the checkout and parse per-test contexts; none →
+   `no_localization`.
+2. Collect failing ids from the CI targets and the rerun attempts, then `localize`; no
+   suspects → `no_localization`.
+3. `build_terms` + `git_log_argv` + `_run_git` + `parse_git_log` + `rank`, keeping the top
+   five prior fixes (best-effort).
+4. Read the suspect source files, bounded and confined to the checkout.
+5. Build the LLM (`self._llm` in tests, else `build_llm(settings)`); unavailable →
+   `no_llm` with suspects and prior fixes.
+6. For up to `max_fix_attempts` (default 3): build the prompt, append the last three
+   feedback messages, call the model, `extract_diff`, run `check_policy`, copy the checkout
+   to a temp directory, `git apply --check` then `git apply`, and run the four gates. All
+   four passing → **`proven`**, retaining the patched copy for the async push. Otherwise
+   keep the best attempt by gates-passed count and feed the failure back.
+7. Return `proven`, `gates_failed`, `rejected` (only policy refused every diff), `no_diff`,
+   `no_llm`, `no_localization` or `error`.
+
+### Persisted and posted per outcome
+The blocking thread returns a `FixOutcome`; the async half persists it in the S1
+transaction and then posts. `_persist_fix` writes:
+
+- `suspects` (`job_id`, `file`, `line`, `score`, `rank`) whenever localization found any;
+- `fixes` (`job_id`, top `suspect_id`, `attempt`, `diff`, `status`) whenever a diff exists,
+  even if it was rejected or failed its gates;
+- `gate_results` (`fix_id`, `gate`, `passed`, `measured_value`, `baseline_value`) for the
+  recorded fix's measured gates.
+
+Policy violations and prior fixes are surface evidence and are not persisted in those
+tables. `no_localization` writes nothing; `no_diff`, `no_llm` and `no_localization` have no
+`fixes` row (suspects may still exist).
+
+| Outcome | Rows | Surface |
+|---|---|---|
+| `proven` | suspects, one fix (`proven`), four gate rows | `pr` mode: push `janus/fix-<job>` and open a **draft** PR; otherwise the suggest comment |
+| `gates_failed` | suspects, best fix, its gate rows | suggest comment (why the proof failed) |
+| `rejected` | suspects, last fix | suggest comment (policy violations) |
+| `no_diff` | suspects only | suggest comment ("No diff was produced.") |
+| `no_llm` | suspects only | suggest comment |
+| `no_localization` | none | none beyond the triage verdict |
+| `error` | suspects, plus a fix only if a diff existed | suggest comment |
+
+In suggest mode the comment is posted on the run's PR when it has one; otherwise the same
+body goes into a neutral Check run named `"<triage check name>: fix"`. In `pr` mode a
+push/PR failure is logged and falls back to the suggest comment. The triage Check run and
+evidence comment are posted first and unconditionally; posting is best-effort. The retained
+patched checkout is removed in `_cleanup_fix_workdir` on every path. Branch pushes are
+normal (never forced), PRs are draft-only, and no merge/approve path exists (D-076).
+
+---
+
+## 11. Cross-cutting behaviours
 
 - **Idempotency.** Webhook redeliveries are deduped by the `deliveries` PK; a job is
   one-per-delivery (`jobs.delivery_id` unique). Both are database constraints, not
@@ -525,19 +640,19 @@ in the sandbox (Docker-gated).
 
 ---
 
-## 11. Still stubbed / deferred
+## 12. Still stubbed / deferred
 
 See [`FUTURE.md`](FUTURE.md) for the full ledger. In short:
 
-- **Fix loop (S2):** `janus/core/{localize,retrieve,generate,prove}`, `janus/report/pr.py`.
-  `SandboxProcessor._maybe_fix` is the seam it fills. `git bisect` is deferred — the source
-  clone is `--depth 1`, so there is no history to bisect (D-070) — and SBFL is the localizer.
 - **Benchmark harness (Phase 8):** the BugsInPy subset harness and metrics table (`bench/`).
+- **`git bisect`:** `janus/core/localize/bisect.py` is only a planner/parser; the source
+  clone is `--depth 1`, so there is no history to bisect (D-070) and
+  `suspects.introducing_commit` stays `NULL`.
+- **Output idempotency marker:** `janus/report/markers.py` (needed before the brain posts
+  comments/checks/PRs without risking duplicates).
 - **Backend D4–D6:** fairness/rate limits/budgets (`janus/jobs/{ratelimit,budgets}.py`),
   dedup, observability (`janus/observability/`), load test (`bench/`), Redis, and
   `docs/DESIGN.md`.
-- **Output idempotency marker:** `janus/report/markers.py` (needed before the brain posts
-  comments/checks).
 
-The worker calls the brain via `JobProcessor`; the S1 pieces above are implemented, and these
-modules are empty until their phases.
+The worker calls the brain via `JobProcessor`; S0–S2 are implemented, and these remaining
+items are the tracked follow-ups.

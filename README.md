@@ -20,9 +20,10 @@ with admin requeue, cost caps, quotas and a kill switch. The **sandbox core** (P
 built too: TOML-configured, two-phase container runs with `docker cp`, resource limits,
 telemetry and secret redaction. The **adapter layer** is built: the `Adapter` protocol, its
 conformance suite and the Python adapter. **S1 (Phase 4) is implemented**: the reproducer,
-the seven signal collectors, the scorer and the evidence surface (see below). The **fix loop
-and PR mode (S2)** are still stubbed and tracked in [`docs/FUTURE.md`](docs/FUTURE.md).
-Backend spec: [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
+the seven signal collectors, the scorer and the evidence surface. **S2 (Phases 5–7) is also
+implemented**: SBFL localization, git-log retrieval, LLM diff generation, the four proof
+gates plus the static policy gate, and suggest/draft-PR surfaces (see below). Backend spec:
+[`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
 [`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md); adapter spec:
 [`docs/specs/ADAPTER.md`](docs/specs/ADAPTER.md); triage spec:
 [`docs/specs/S1.md`](docs/specs/S1.md).
@@ -68,8 +69,7 @@ curl -s -X POST localhost:8000/admin/jobs/<id>/requeue
 ```
 
 The processor is a no-op stub by default; set `processor_mode = "sandbox"` to run the S1
-reproduce-and-triage brain (see below). The S2 fix loop is still stubbed
-(see `docs/FUTURE.md`).
+reproduce-and-triage brain and, for `CODE_BUG`, the S2 fix loop (see below).
 
 ## Adapter and processor
 
@@ -100,13 +100,36 @@ With `processor_mode = "sandbox"`, a claimed job runs the S1 pipeline:
    leads the runner-up by more than `epsilon` (default `0.05`); otherwise the verdict is
    `UNSURE`. The routes are `CODE_BUG`, `FLAKY`, `ENV` and `UNSURE`.
 4. **Report.** The verdict is posted as a **"Janus triage" Check run**, and — when the run
-   belongs to a pull request — an evidence comment. Only **`CODE_BUG`** would proceed to a fix;
-   **`FLAKY`, `ENV` and `UNSURE` are comment-only**. The fix loop is S2, so a `CODE_BUG` verdict
-   currently stops at the `_maybe_fix` seam.
+   belongs to a pull request — an evidence comment. Only **`CODE_BUG`** proceeds to the S2 fix
+   loop; **`FLAKY`, `ENV` and `UNSURE` are comment-only**.
 
 Thresholds (`k_reruns`, `tau`, `epsilon`, caps) come from the environment or `janus.toml`, and a
 repository can override them in a committed `.janus.yml`. The S1 seed repo lives at
 `tests/fixtures/sample_repo/` (a logic bug, a driven flake, an ENV case and a control).
+
+## Fix loop
+
+With `processor_mode = "sandbox"`, a **`CODE_BUG`** verdict continues into S2. `FLAKY`, `ENV`
+and `UNSURE` never reach it.
+
+1. **Localize.** One per-test coverage run feeds SBFL (Ochiai by default, DStar optional),
+   which ranks `file:line` suspects; lines covered only by passing tests are excluded.
+   `git bisect` is deferred because the checkout is shallow (D-070).
+2. **Retrieve.** Deterministic terms from the failing tests, suspect files and error lines
+   grep `git log -p` for similar past fixes — no vector database.
+3. **Generate.** An OpenAI-compatible endpoint (or a local one) receives a bounded prompt
+   with the evidence, suspects, source and prior fixes, and returns a unified diff. Up to
+   three attempts use gate feedback. Without a key the loop degrades to a comment.
+4. **Prove.** The static policy gate rejects test edits, CI weakening, skip/xfail, lowered
+   thresholds and removed assertions. The four measured gates — full suite green, mutation
+   non-regression, coverage non-regression and a test-file hash lock — fail closed when a
+   measurement is missing. `mutation_gate_enabled = false` shows the gate as `disabled`.
+5. **Surface.** The default **suggest** mode comments on the PR (or posts a neutral fix
+   Check run when there is no PR). `mode: pr` in `.janus.yml` opens a **draft** PR from
+   `janus/fix-<job_id>` with the verification table. Janus never merges and never
+   force-pushes, and a push/PR failure falls back to the comment.
+
+The S2 contract is [`docs/specs/S2.md`](docs/specs/S2.md).
 
 ## Sandbox configuration
 
@@ -204,5 +227,5 @@ JANUS_GITHUB_WEBHOOK_SECRET=<secret> \
 **In scope:** manifest install, HMAC-verified webhooks, log + last-green→first-red diff
 fetch, Check run, Postgres schema for installations/repositories/runs/jobs/diagnoses.
 
-**Non-goals until S0 is demoed:** sandbox reproduction, triage scoring, the CODE_BUG
-fix loop, PR mode, and every deferred item in `PLAN.md` §3.
+**Non-goals for S0 (delivered in S1/S2):** sandbox reproduction, triage scoring, the
+CODE_BUG fix loop and PR mode. Every deferred item in `PLAN.md` §3 remains out of scope.

@@ -89,7 +89,7 @@ brain (S1/S2) plugs into the worker without changing the pipeline.
 - **Pipeline wiring (Phase 4):** *done* — `janus/jobs/processor.py` fetches the CI log,
   parses the failing tests, checks out the revision, reproduces, resolves the change,
   collects and scores, persists, and posts a "Janus triage" Check run (+ a PR comment when
-  the run has a PR); `_maybe_fix` is the documented S2 seam.
+  the run has a PR). A `CODE_BUG` verdict continues into the S2 fix loop (§C).
 - **Sample fixture repo (Phase 4):** *done* — `tests/fixtures/sample_repo/` holds a
   deterministic logic bug, a driven flake, an ENV case and an always-green control, plus a
   `requirements.txt` and an example `.janus.yml`; `norecursedirs` keeps pytest from
@@ -102,15 +102,28 @@ brain (S1/S2) plugs into the worker without changing the pipeline.
 
 ## C. Fix loop (S2) — localize, retrieve, generate, prove, PR
 
-- **Localize:** SBFL (Ochiai/DStar) over per-test coverage → ranked `file:line`; sandbox
-  `git bisect`.
-- **Retrieve:** `git log -p` grep on the fault signature.
-- **Generate:** LLM minimal source-only unified diff (≤3 retries with verifier feedback).
-- **Prove:** suite green, mutation non-regression, coverage non-regression, test-file hash
-  lock + policy gate.
-- **PR mode:** `.janus.yml` `mode: pr|suggest` (default suggest); PR-only, no auto-merge,
-  no force-push.
-- **Benchmark (Phase 8):** BugsInPy subset harness + metrics table.
+**Status: done (Phases 5–7).** The loop runs only for `CODE_BUG`, inside the source
+context, and is described in `docs/specs/S2.md`.
+
+- **Localize:** *done* — SBFL over per-test coverage (Ochiai default, DStar optional) →
+  ranked `file:line` (`janus/core/localize/sbfl.py`). `git bisect` remains deferred (below).
+- **Retrieve:** *done* — `git log -p` grep on deterministic terms from failing tests,
+  suspect files and error lines (`janus/core/retrieve/git_grep.py`); no vector DB.
+- **Generate:** *done* — an OpenAI-compatible HTTP client emits a minimal source-only
+  unified diff, with `NullLLM` degrading to a comment; up to `max_fix_attempts` (default 3)
+  attempts with verifier/gate feedback (`janus/core/generate/**`).
+- **Prove:** *done* — the four measured gates (suite green, mutation non-regression,
+  coverage non-regression, test-file hash lock) fail closed, plus the static policy gate
+  (test edits, CI weakening, skip/xfail, lowered thresholds, removed assertions)
+  (`janus/core/prove/**`).
+- **PR mode:** *done* — `.janus.yml` `mode: pr|suggest` (default suggest); `pr` pushes
+  `janus/fix-<job>` and opens a **draft** PR with the verification table; never merges and
+  never force-pushes (`janus/report/pr.py`, `janus/github/push.py`).
+- **Benchmark (Phase 8):** *deferred* — the BugsInPy subset harness and metrics table,
+  including the false-fix rate.
+- **`git bisect`:** *deferred* — only the pure planner/parser exists
+  (`janus/core/localize/bisect.py`); the source clone is `--depth 1`, so there is no
+  ancestry to bisect and `suspects.introducing_commit` stays `NULL` (ADR D-070).
 
 ## D. Output idempotency marker (needed by D2/D3 in production)
 - Check runs/comments must carry a hidden marker with the job's idempotency key, and the
