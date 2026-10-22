@@ -1,32 +1,108 @@
 # Janus
 
-When CI goes red, Janus decides whether the fault is your code, your tests, or your
-pipeline. For code bugs it localizes the fault, writes a fix, proves it with gates, and
-opens a PR.
+Janus watches your CI. When a build goes red, it works out whether the fault is your
+**code**, your **tests**, or your **infrastructure** — and for a code bug it localizes the
+fault, writes a fix, proves it against measured gates, and opens a pull request.
 
-> Full plan: [`PLAN.md`](PLAN.md) · Architecture & build order:
-> [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md) · Milestone specs:
-> [`docs/specs/S0.md`](docs/specs/S0.md) · [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md) ·
-> [`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md) · Component reference:
-> [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · First principles:
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) · Design notes:
-> [`docs/DECISIONS.md`](docs/DECISIONS.md)
+A red build is a signal with an ambiguous cause, and today the response is a guess: someone
+reruns it, reads the log, and either patches the code, quarantines a flaky test, or blames
+the runner. Janus replaces the guess with a deterministic, explainable verdict and — only
+where mutation is provably safe to attempt — a proven patch.
 
-## Status
+> Plan: [`PLAN.md`](PLAN.md) · Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+> Component reference: [`docs/COMPONENTS.md`](docs/COMPONENTS.md) · Design notes:
+> [`docs/DECISIONS.md`](docs/DECISIONS.md) · Specs: [`docs/specs/`](docs/specs)
 
-The **backend pipeline** (D1–D3 of the backend spec) is built: idempotent ingest,
-a Postgres-as-queue with leases/heartbeat/reaper, retries with full jitter, dead-letter
-with admin requeue, cost caps, quotas and a kill switch. The **sandbox core** (Phase 3) is
-built too: TOML-configured, two-phase container runs with `docker cp`, resource limits,
-telemetry and secret redaction. The **adapter layer** is built: the `Adapter` protocol, its
-conformance suite and the Python adapter. **S1 (Phase 4) is implemented**: the reproducer,
-the seven signal collectors, the scorer and the evidence surface. **S2 (Phases 5–7) is also
-implemented**: SBFL localization, git-log retrieval, LLM diff generation, the four proof
-gates plus the static policy gate, and suggest/draft-PR surfaces (see below). Backend spec:
-[`docs/specs/BACKEND.md`](docs/specs/BACKEND.md); sandbox spec:
-[`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md); adapter spec:
-[`docs/specs/ADAPTER.md`](docs/specs/ADAPTER.md); triage spec:
-[`docs/specs/S1.md`](docs/specs/S1.md).
+## The problem, and what Janus does
+
+A failing test can mean three mutually exclusive things: the **code** is wrong, the
+**test** is wrong (non-deterministic or stale), or the **environment/pipeline** is wrong
+(out of memory, a network reset, a registry rate-limit, a full disk). The correct response
+to each is different, and the *wrong* response is actively harmful — editing a real bug's
+test hides the bug, and "fixing" an infra outage by changing code makes the code worse.
+
+So Janus classifies before it mutates. It produces one of four outcomes:
+
+| Outcome | Plain meaning | What Janus does |
+|---|---|---|
+| `CODE_BUG` | A real defect in your source. | Proceeds to the fix loop (below). |
+| `FLAKY` | The test is non-deterministic. | Comment only. |
+| `ENV` | The environment or pipeline broke. | Comment only. |
+| `UNSURE` | The evidence is not strong enough to route. | Comment only — Janus never guesses. |
+
+The pipeline, end to end:
+
+```
+GitHub red build ─▶ webhook ─▶ queue ─▶ reproduce ─▶ triage ─▶ verdict
+                                         (K reruns)   (7 signals)  │
+                                                                    ├─ CODE_BUG ─▶ localize ─▶ retrieve
+                                                                    │                          │
+                                                                    │            ship ◀─ prove ◀─ generate
+                                                                    │
+                                                                    └─ FLAKY / ENV / UNSURE ─▶ comment only
+```
+
+## How it decides
+
+Triage scores seven independent signals. Each signal votes support in `[0, 1]` for the
+three real routes, or **abstains** when it has no evidence — a missing signal is not a zero
+vote.
+
+| Signal | What it looks at | What it argues for |
+|---|---|---|
+| `determinism` | the K reruns | `CODE_BUG` when every rerun fails; `FLAKY` when the failure is intermittent |
+| `signatures` | stdout/stderr excerpts | `ENV` for timeout / `ECONNRESET` / 429-503 / `ENOSPC` / OOM / `SIGKILL` / DNS strings; `CODE_BUG` for assertion-style failures |
+| `exit_codes` | the process exit code | `ENV` for 137 / 124 (kill / timeout); `CODE_BUG` for 1 / 2 |
+| `resources` | cgroup telemetry + duration spread | `ENV` on an OOM kill, near the memory cap, or an order-of-magnitude stall; weakly `CODE_BUG` otherwise |
+| `change_attribution` | the last-green → first-red diff | `CODE_BUG` when a changed file is a failing test's module; `ENV` when the diff touches nothing related |
+| `correlation` | CI facts (cache, runner, matrix leg) | `ENV` for a cache miss, a retried job, a runner change, or a matrix leg that only fails there |
+| `flake_history` | per-test historical failure rate | `FLAKY` at ≥ 0.30; `CODE_BUG` when every target is ≤ 0.05 |
+
+The scorer takes a **weighted average over the signals that reported**, so an abstaining
+signal does not dilute the score. Default weights sum to 1.0:
+
+| Signal | Weight |
+|---|---:|
+| `determinism` | 0.22 |
+| `signatures` | 0.18 |
+| `change_attribution` | 0.16 |
+| `exit_codes` | 0.14 |
+| `correlation` | 0.10 |
+| `flake_history` | 0.10 |
+| `resources` | 0.10 |
+
+The decision rule then picks the highest-scoring route **only if** it reaches `tau`
+(default `0.80`) **and** leads the runner-up by more than `epsilon` (default `0.05`).
+Otherwise the verdict is `UNSURE`.
+
+This verdict is **deterministic and explainable — there is no LLM in it.** Every signal's
+raw and normalized value, and the resulting diagnosis (route, confidence, top-two gap), is
+stored as a database row, so a comment or PR can cite exactly why a route was chosen. The
+verdict is posted as a **"Janus triage"** Check run, and — when the failing run belongs to a
+pull request — as an evidence comment.
+
+## The fix loop
+
+Only a `CODE_BUG` verdict reaches the fix loop; `FLAKY`, `ENV` and `UNSURE` stop at the
+comment. The loop runs inside the checkout:
+
+1. **Localize.** One per-test coverage run feeds SBFL (Ochiai by default, DStar optional),
+   which ranks `file:line` suspects. Lines covered only by passing tests are excluded.
+2. **Retrieve.** Deterministic terms from the failing tests, suspect files and error lines
+   grep `git log -p` for similar past fixes — no vector database.
+3. **Generate.** An OpenAI-compatible endpoint receives a bounded prompt (evidence,
+   suspects, source, prior fixes) and returns a unified diff. Up to three attempts use gate
+   feedback from the previous try.
+4. **Prove.** A static policy gate rejects test edits, CI weakening, skip/xfail, lowered
+   thresholds and removed assertions. Then four measured gates run: **full suite green**,
+   **mutation non-regression**, **coverage non-regression**, and a **test-file hash lock**.
+   A missing measurement fails closed.
+5. **Ship.** The default `suggest` mode comments on the PR (or posts a neutral Check run
+   when there is no PR). `mode: pr` in `.janus.yml` opens a **draft** PR from
+   `janus/fix-<job_id>` carrying the verification table.
+
+**Safety properties.** Janus never merges, never force-pushes, and never edits your tests.
+Without an LLM key the loop degrades to a comment rather than a speculative change.
 
 ## Requirements
 
@@ -49,91 +125,70 @@ Then check liveness:
 curl -s localhost:8000/health    # -> {"status":"ok"}
 ```
 
-## Running the worker
-
-The orchestrator consumes the `jobs` table. In a second terminal (run several for a pool):
+Run a worker in a second terminal (start several for a pool):
 
 ```bash
 uv run python -m janus.jobs.worker
 ```
 
-Each worker claims with `SELECT ... FOR UPDATE SKIP LOCKED`, stamps a lease, heartbeats
-while processing, and a reaper requeues jobs whose lease expired (so `kill -9` is safe).
-It enforces full-jitter retries, cost caps, per-repo quotas and the kill switch.
+The worker consumes the `jobs` table. It claims with `SELECT ... FOR UPDATE SKIP LOCKED`,
+stamps a lease and heartbeats while processing, and a reaper requeues jobs whose lease
+expired — so `kill -9` is safe. It enforces full-jitter retries, cost caps, per-repo quotas
+and the kill switch.
 
-Dead-letter admin endpoints:
+## Connecting a repository
+
+**Install the GitHub App (manifest flow).**
+
+1. Start a tunnel (below) and set `JANUS_PUBLIC_URL` to its HTTPS URL in `.env`.
+2. Visit `http://localhost:8000/manifest/start` in a browser. It submits the App manifest
+   to GitHub.
+3. Approve the App. GitHub redirects to `/manifest/callback`, which writes the private key
+   to `JANUS_GITHUB_PRIVATE_KEY_PATH` and records the App id, webhook secret and OAuth
+   credentials in `.env`.
+4. Restart the app so the new settings load, then point the App's webhook at
+   `<JANUS_PUBLIC_URL>/webhooks/github` if GitHub did not set it automatically. The webhook
+   secret must match `JANUS_GITHUB_WEBHOOK_SECRET`.
+
+**Local webhooks.** GitHub cannot reach `localhost`, so expose the app with a tunnel and
+point the App's webhook URL at `POST /webhooks/github`:
+
+- [smee.io](https://smee.io/) — create a channel and forward events to the local port.
+- [ngrok](https://ngrok.com/) — `ngrok http 8000` and use the HTTPS URL.
+
+To exercise signature verification and persistence without GitHub, post a signed
+`workflow_run` payload with the bundled script:
 
 ```bash
-curl -s localhost:8000/admin/dead
-curl -s -X POST localhost:8000/admin/jobs/<id>/requeue
+JANUS_GITHUB_WEBHOOK_SECRET=<secret> \
+  uv run python scripts/post_test_webhook.py --url http://localhost:8000/webhooks/github
 ```
 
-The processor is a no-op stub by default; set `processor_mode = "sandbox"` to run the S1
-reproduce-and-triage brain and, for `CODE_BUG`, the S2 fix loop (see below).
+**Per-repository config.** A repository can commit a `.janus.yml` next to its code. Every
+key is optional; an omitted key falls back to the process-wide setting. It is read as
+untrusted repository content and must never contain secrets.
 
-## Adapter and processor
+```yaml
+# "suggest" comments only; "pr" also opens a draft pull request.
+mode: suggest
 
-The core is language-agnostic: everything language-specific sits behind the `Adapter` protocol in
-`janus/core/adapter.py`, which turns CI logs, sandbox results and tool artifacts into neutral types
-and the core's intent into argv commands. An adapter is a **pure translator** — it holds no sandbox
-and no policy. The **Python adapter** (`janus/adapters/python/`) is implemented: pytest (JSON
-report), coverage.py contexts and mutmut, with structured reports read back as container artifacts
-under `/var/tmp/janus`.
+# Reruns per failing target while reproducing (>= 1).
+k_reruns: 3
 
-By default the worker runs the no-op `stub` processor. Set `processor_mode = "sandbox"` (in
-`janus.toml`, or `JANUS_PROCESSOR_MODE=sandbox`) to make the worker run real work in a container:
-acquire the source, run the adapter's commands, parse the outcomes.
+# Accept a route only at or above tau, and only if it beats the runner-up by more than epsilon.
+tau: 0.8
+epsilon: 0.05
+```
 
-## Reproduce and triage
+`mode`, `k_reruns`, `tau` and `epsilon` are honoured today. The parser also accepts
+`max_sandbox_minutes`, `max_llm_tokens`, `setup_command` and `test_command`, but those are
+**not applied yet**: the per-failure caps are process-wide only, and the commands a run
+executes come from the language adapter (see below). A malformed file is reported rather
+than silently ignored.
 
-With `processor_mode = "sandbox"`, a claimed job runs the S1 pipeline:
+## Configuration
 
-1. **Reproduce.** Rerun the failing targets **K times** (`k_reruns`, default 5) in the sandbox,
-   then run the **full suite once** at the end. K reruns of the failing-target *set* (not per
-   test) separate a deterministic failure from an intermittent one at a predictable cost. A
-   sandbox-level failure is recorded as evidence, not raised.
-2. **Score seven signals.** `determinism`, `signatures`, `exit_codes`, `resources`,
-   `change_attribution`, `correlation` and `flake_history`, each voting support in `[0, 1]` for
-   the three real routes. A signal with no evidence **abstains**; the scorer averages the votes
-   by weight over the signals that reported, so a missing signal does not dilute the score.
-3. **Decide.** The argmax route wins only if its score is `>= tau` (default `0.80`) **and** it
-   leads the runner-up by more than `epsilon` (default `0.05`); otherwise the verdict is
-   `UNSURE`. The routes are `CODE_BUG`, `FLAKY`, `ENV` and `UNSURE`.
-4. **Report.** The verdict is posted as a **"Janus triage" Check run**, and — when the run
-   belongs to a pull request — an evidence comment. Only **`CODE_BUG`** proceeds to the S2 fix
-   loop; **`FLAKY`, `ENV` and `UNSURE` are comment-only**.
-
-Thresholds (`k_reruns`, `tau`, `epsilon`, caps) come from the environment or `janus.toml`, and a
-repository can override them in a committed `.janus.yml`. The S1 seed repo lives at
-`tests/fixtures/sample_repo/` (a logic bug, a driven flake, an ENV case and a control).
-
-## Fix loop
-
-With `processor_mode = "sandbox"`, a **`CODE_BUG`** verdict continues into S2. `FLAKY`, `ENV`
-and `UNSURE` never reach it.
-
-1. **Localize.** One per-test coverage run feeds SBFL (Ochiai by default, DStar optional),
-   which ranks `file:line` suspects; lines covered only by passing tests are excluded.
-   `git bisect` is deferred because the checkout is shallow (D-070).
-2. **Retrieve.** Deterministic terms from the failing tests, suspect files and error lines
-   grep `git log -p` for similar past fixes — no vector database.
-3. **Generate.** An OpenAI-compatible endpoint (or a local one) receives a bounded prompt
-   with the evidence, suspects, source and prior fixes, and returns a unified diff. Up to
-   three attempts use gate feedback. Without a key the loop degrades to a comment.
-4. **Prove.** The static policy gate rejects test edits, CI weakening, skip/xfail, lowered
-   thresholds and removed assertions. The four measured gates — full suite green, mutation
-   non-regression, coverage non-regression and a test-file hash lock — fail closed when a
-   measurement is missing. `mutation_gate_enabled = false` shows the gate as `disabled`.
-5. **Surface.** The default **suggest** mode comments on the PR (or posts a neutral fix
-   Check run when there is no PR). `mode: pr` in `.janus.yml` opens a **draft** PR from
-   `janus/fix-<job_id>` with the verification table. Janus never merges and never
-   force-pushes, and a push/PR failure falls back to the comment.
-
-The S2 contract is [`docs/specs/S2.md`](docs/specs/S2.md).
-
-## Sandbox configuration
-
-Sandbox behaviour is configured in [`janus.toml`](janus.toml) (or `[tool.janus]` in
+Process-wide settings live in [`janus.toml`](janus.toml) (or `[tool.janus]` in
 `pyproject.toml`; set `JANUS_CONFIG_FILE` to use another path). Environment variables
 override the file, with nested keys using a double underscore, e.g.
 `JANUS_SANDBOX__IMAGE=python:3.12-slim`.
@@ -157,26 +212,97 @@ telemetry_sample_interval_seconds = 0.2
 require_rootless = false       # true => fail closed unless the daemon is rootless
 network = false                # false => no network AND the setup phase is skipped
 allow_hosts = []               # enforced by the allowlisting egress proxy; empty = any host
-setup_command = []             # phase A (network on)
-test_command = []              # phase B (always offline)
 ```
 
-A run is up to two phases: **setup** installs dependencies with the network on, **tests**
-always run offline. If `network` is false, setup is skipped and only the offline test phase
-runs. Each run builds its own image (from the repository Dockerfile or a Janus-generated one)
-and removes it afterwards; `image_source = "prebuilt"` uses `image` as-is. When `network` is
-true and `allow_hosts` is non-empty, the run joins an internal network whose only route out is
-an allowlisting proxy, so only the listed hosts are reachable (ADR D-059). The container never
-receives the Docker socket and no host path is bind-mounted. Output is streamed, bounded at
-`max_output_bytes`, and redacted before it leaves the sandbox.
+The commands a run executes come from the **language adapter**, not from this file. The
+Python adapter runs `pytest` with a JSON report and per-test coverage contexts, and needs no
+setup step because its tooling is installed while the per-run image is built. A run is
+therefore up to two phases — **setup** with the network on, then **tests** always offline —
+and with the Python adapter only the offline test phase runs. Each run builds its own image
+(from the repository Dockerfile or a Janus-generated one) and removes it afterwards;
+`image_source = "prebuilt"` uses `image` as-is. When `network` is true and `allow_hosts` is
+non-empty, the run joins an internal network whose only route out is an allowlisting proxy,
+so only the listed hosts are reachable.
 
-The Docker-gated sandbox tests skip themselves when no daemon is reachable:
+## Safety model
 
-```bash
-uv run pytest tests/integration/test_sandbox_runner.py -q
-```
+The sandbox is the boundary closest to the danger, so the guarantees live there:
 
-## Quality
+- **No `docker.sock`** inside the sandbox and **no host bind mounts** — the source is copied
+  in with `docker cp`.
+- **Dropped capabilities**, `no-new-privileges`, and a **non-root** run user.
+- **CPU, memory and PID caps**, plus a wall-clock timeout that kills the container.
+- **Tests run offline**; when egress is allowed it is an **enforced host allowlist** through
+  an internal network and an allowlisting proxy — a non-listed host is unreachable even if
+  the proxy variables are ignored.
+- **Output is streamed and bounded** at `max_output_bytes` (the stream is still drained so a
+  chatty command cannot block).
+- **Secrets are redacted** before anything leaves the sandbox.
+- **`require_rootless`** makes a non-rootless daemon fail closed in production.
+
+## Operations
+
+- **Kill switch.** Stored as a `system_flags` row and read on every claim, so flipping it
+  stops claiming immediately without a redeploy. `JANUS_KILL_SWITCH` is a hard env-level
+  override.
+- **Cost caps and quota.** Exceeding `max_sandbox_minutes` or `max_llm_tokens`, or a
+  per-repo quota, routes the job to terminal `skipped_budget`: report what was observed,
+  spend nothing more.
+- **Dead-letter admin.** Inspect and requeue dead jobs:
+
+  ```bash
+  curl -s localhost:8000/admin/dead
+  curl -s -X POST localhost:8000/admin/jobs/<id>/requeue
+  ```
+
+- **Crash safety.** A claim stamps a lease; a background task heartbeats it; a reaper
+  requeues running jobs whose lease expired (without consuming an attempt). `kill -9` mid-job
+  leaves a `running` row that is recovered, never a lost job or a half-open transaction.
+
+## Measured performance
+
+From [`bench/RESULTS.md`](bench/RESULTS.md) (reproduce with `uv run python bench/run_bench.py`):
+
+| Measurement | Value |
+|---|---:|
+| Ingest + enqueue latency (p50 / p95 / p99) | 8.726 / 12.240 / 14.196 ms |
+| Single-worker drain throughput | 50.7 jobs/s |
+| Sandbox image build (cold / cached) | 20.762 s / 2.540 s |
+| Sandbox trivial-command latency (p50) | 1.495 s |
+| Reproduce a failing target (k=5 + full suite) | 12.015 s (`cost_minutes` 0.177) |
+
+The benchmark's own caveats apply: it is a single-case smoke measurement, not an accuracy
+metric, and it does not measure triage accuracy on a labelled set, real GitHub API latency,
+LLM quality, multi-worker throughput, or chaos behaviour.
+
+## Limitations
+
+- **Python / pytest only.** The core is language-agnostic behind the `Adapter` protocol, but
+  only the Python adapter (pytest, coverage.py, mutmut) exists.
+- **No labelled accuracy benchmark yet.** The BugsInPy-style confusion matrix is not built;
+  the triage result in the benchmark is a single-case smoke test.
+- **The correlation signal has no CI metadata wired yet.** It reads an empty context today,
+  so it abstains.
+- **`git bisect` is deferred.** The localizer ranks `file:line` suspects, but the checkout is
+  shallow, so no introducing commit is found.
+- **The mutation gate depends on parsing mutmut output**, and can be disabled
+  (`mutation_gate_enabled = false`), in which case it is reported as `disabled`.
+- **The admin endpoints are unauthenticated** — put them behind your own access control.
+
+## Documentation
+
+- [`PLAN.md`](PLAN.md) — what the product is and what it deliberately is not.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the problem decomposed, and why the system is shaped this way.
+- [`docs/COMPONENTS.md`](docs/COMPONENTS.md) — how each component works.
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — the decision log (ADRs).
+- [`docs/specs/S0.md`](docs/specs/S0.md) — GitHub App spine.
+- [`docs/specs/S1.md`](docs/specs/S1.md) — reproduce and triage.
+- [`docs/specs/S2.md`](docs/specs/S2.md) — the `CODE_BUG` fix loop.
+- [`docs/specs/SANDBOX.md`](docs/specs/SANDBOX.md) — the container runner.
+- [`docs/specs/ADAPTER.md`](docs/specs/ADAPTER.md) — the adapter protocol and Python adapter.
+- [`docs/specs/BACKEND.md`](docs/specs/BACKEND.md) — ingest, queue and worker.
+
+## Development
 
 ```bash
 uv run ruff check . && uv run ruff format --check .
@@ -192,40 +318,8 @@ JANUS_TEST_DATABASE_URL=postgresql+asyncpg://janus:janus@localhost:5432/janus_te
   uv run pytest -q
 ```
 
-## Receiving webhooks locally
-
-GitHub cannot reach `localhost`, so expose the app with a tunnel and point the GitHub
-App's webhook URL at `POST /webhooks/github`:
-
-- [smee.io](https://smee.io/) — create a channel and forward events to the local port.
-- [ngrok](https://ngrok.com/) — `ngrok http 8000` and use the HTTPS URL.
-
-The Phase 1 manifest flow (`/manifest/start`) creates the App and stores its
-credentials; the webhook secret must match `JANUS_GITHUB_WEBHOOK_SECRET`.
-
-To exercise signature verification and persistence without GitHub, post a signed
-`workflow_run` payload with the bundled script:
+The Docker-gated sandbox tests skip themselves when no daemon is reachable:
 
 ```bash
-JANUS_GITHUB_WEBHOOK_SECRET=<secret> \
-  uv run python scripts/post_test_webhook.py --url http://localhost:8000/webhooks/github
+uv run pytest tests/integration/test_sandbox_runner.py -q
 ```
-
-## Installing the GitHub App (manifest flow)
-
-1. Start a tunnel and set `JANUS_PUBLIC_URL` to its HTTPS URL in `.env`.
-2. Visit `http://localhost:8000/manifest/start` in a browser. It submits the App
-   manifest to GitHub.
-3. Approve the App. GitHub redirects to `/manifest/callback`, which writes the private
-   key to `JANUS_GITHUB_PRIVATE_KEY_PATH` and records the App id, webhook secret and
-   OAuth credentials in `.env`.
-4. Restart the app so the new settings load. Point the App's webhook at
-   `<JANUS_PUBLIC_URL>/webhooks/github` if GitHub did not set it automatically.
-
-## Scope & non-goals (S0)
-
-**In scope:** manifest install, HMAC-verified webhooks, log + last-green→first-red diff
-fetch, Check run, Postgres schema for installations/repositories/runs/jobs/diagnoses.
-
-**Non-goals for S0 (delivered in S1/S2):** sandbox reproduction, triage scoring, the
-CODE_BUG fix loop and PR mode. Every deferred item in `PLAN.md` §3 remains out of scope.
