@@ -642,7 +642,8 @@ normal (never forced), PRs are draft-only, and no merge/approve path exists (D-0
 
 ## 12. Still stubbed / deferred
 
-See [`FUTURE.md`](FUTURE.md) for the full ledger. In short:
+Still outstanding: the benchmark harness, `git bisect` execution, the output-idempotency
+marker, and the backend fairness/rate-limit/budget work.
 
 - **Benchmark harness (Phase 8):** the BugsInPy subset harness and metrics table (`bench/`).
 - **`git bisect`:** `janus/core/localize/bisect.py` is only a planner/parser; the source

@@ -1,6 +1,6 @@
 # Janus — Sandbox Spec (Phase 3)
 
-Source: `PLAN.md` §1.2 and §4, implemented via `docs/IMPLEMENTATION_PLAN.md` §2 (Phase 3).
+Source: `PLAN.md` §1.2 and §4.
 This spec covers the **sandbox** half of Phase 3: running one command in an ephemeral,
 locked-down container and returning trustworthy facts about it.
 

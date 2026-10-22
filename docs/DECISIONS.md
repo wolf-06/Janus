@@ -58,7 +58,7 @@ and uses a managed 3.12 interpreter.
 
 ## D-003 — Flat package layout (`janus/` at repo root)
 
-**Context.** `IMPLEMENTATION_PLAN.md` §1.3 specifies a `janus/` package at the root.
+**Context.** The package lives at the repo root (`janus/`).
 
 **Decision.** Use the flat layout exactly as specified; every package gets an
 `__init__.py`; modules are created as empty stubs and filled per phase.
@@ -277,6 +277,8 @@ initial commit.
 - (+) One source of truth; the alias still resolves.
 - (−) Symlinks are awkward on Windows checkouts; acceptable for this Linux-first project.
 - *Reversible:* yes.
+
+**Superseded (repo hygiene):** the alias was removed; `PLAN.md` is now the only plan file.
 
 ---
 
@@ -1225,7 +1227,7 @@ fails — retries a job whose verdict is already durable and can double-post.
 **Consequences.** (+) The verdict is attached to the commit and, for a PR, mirrored into the
 thread; the acknowledgement and the verdict stay separate surfaces. (+) A GitHub outage cannot
 lose the verdict, which lives in ``diagnoses`` / ``signals`` / ``reproductions``. (−) Until the
-output-idempotency marker (``FUTURE.md`` §D) exists, an at-least-once retry that crashes between
+output-idempotency marker is implemented, an at-least-once retry that crashes between
 post and commit can duplicate the Check run/comment. *Reversible:* yes.
 
 ### D-069 — `.janus.yml` is per-repo config parsed without a new dependency
@@ -1264,8 +1266,8 @@ commit and no ancestry to bisect. The Python adapter already produces per-test c
 run (D-062), which is the input SBFL needs.
 
 **Decision.** SBFL (Ochiai/DStar over the per-test coverage contexts) is the localizer. ``git
-bisect`` is **deferred**: ``Settings.bisect_enabled`` defaults to ``false``, and the deferred
-work is recorded in ``docs/FUTURE.md``. ``suspects.introducing_commit`` exists in the schema (the
+bisect`` is **deferred**: ``Settings.bisect_enabled`` defaults to ``false``.
+``suspects.introducing_commit`` exists in the schema (the
 Phase 4–6 migration) and stays nullable until a history-aware localizer fills it.
 
 **Alternatives.** Unshallow the clone (``git fetch --unshallow``) — multiplies clone time and
@@ -1460,3 +1462,24 @@ mode a human must mark the draft ready and merge it. (+) A push failure still yi
 analysis as a comment. (−) A proven fix needs one extra human action (mark ready) before it
 can land. *Reversible:* yes (change the default), but the merge/force-push omission is
 intentional.
+
+---
+
+## D-077 — Development artifacts are not shipped
+
+**Context.** The repository is published as a **product**, not a build log. The build plan,
+the deferred-work ledger and the raw input specs are **process** documents: they describe how
+Janus was assembled, they confuse a reader who came for the design, and they rot as the code
+moves on. Four such files were tracked: `JANUS_PLAN.txt`, `JANUS_BACKEND_SPEC-7def8ad9.md.txt`,
+`docs/IMPLEMENTATION_PLAN.md` and `docs/FUTURE.md`.
+
+**Decision.** Remove them. The durable design lives in `PLAN.md` (the product plan) and
+`docs/specs/` (the distilled contracts); every reference to a removed file is dropped or
+restated inline.
+
+**Alternatives.** *Keep them* — permanent noise in a public repo. *Move them to a `notes/`
+folder* — still noise, still rots. *Delete `PLAN.md` too* — loses the product rationale the
+ADRs cite.
+
+**Consequences.** (+) The docs are self-contained: no shipped page links to a process file.
+(+) Any future "what's next" list lives in the README, next to the product. *Reversible:* yes.

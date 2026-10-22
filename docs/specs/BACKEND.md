@@ -1,11 +1,12 @@
 # Janus — Backend Pipeline Spec (D1–D6)
 
-Source: `JANUS_BACKEND_SPEC-7def8ad9.md.txt`. This spec covers the durable, at-least-once,
+This spec covers the durable, at-least-once,
 idempotent pipeline. The triage brain is unchanged and sits behind
 `janus.jobs.worker.JobProcessor`.
 
-Status: **D1–D3 implemented** (this document reflects the built system). D4–D6 are
-outlined in [`../FUTURE.md`](../FUTURE.md).
+Status: **D1–D3 implemented** (this document reflects the built system). D4–D6 —
+fairness/rate limits/budgets, failure dedup, observability and the load test — are not
+implemented yet.
 
 ---
 

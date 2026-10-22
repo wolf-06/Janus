@@ -4,8 +4,7 @@ This document explains *why* Janus is shaped the way it is. It deliberately cont
 code: it is a study of the problem, the causal chain that solves it, and the trade-offs
 behind each layer. For the mechanical "how each component works" view see
 [`COMPONENTS.md`](COMPONENTS.md). Concrete, reversible choices live in
-[`DECISIONS.md`](DECISIONS.md); the build order lives in
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+[`DECISIONS.md`](DECISIONS.md).
 
 ---
 

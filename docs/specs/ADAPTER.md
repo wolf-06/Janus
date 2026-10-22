@@ -1,7 +1,6 @@
 # Janus — Adapter Spec (Phase 3)
 
-Source: `PLAN.md` §1.3 and §6, implemented via `docs/IMPLEMENTATION_PLAN.md` §2
-(Phase 3) and §1.3/§1.4. This spec covers the **language-agnostic adapter interface**
+Source: `PLAN.md` §1.3 and §6. This spec covers the **language-agnostic adapter interface**
 and the **conformance suite** every adapter must pass. It is the second half of Phase 3;
 the first half — the sandbox — is specified in [`SANDBOX.md`](SANDBOX.md).
 

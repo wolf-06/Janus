@@ -1,7 +1,7 @@
 """Baseline (last-green) resolution for the fault diff.
 
 To show *what changed* between a passing and failing build, we need a base commit. The
-definition (``docs/IMPLEMENTATION_PLAN.md`` §5 Q2) is **the previous successful workflow
+definition is **the previous successful workflow
 run on the same branch**, validated to be an ancestor of the failing head.
 
 GitHub returns runs newest-first, so the first completed ``success`` that is not the
